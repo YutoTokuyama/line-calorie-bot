@@ -9,7 +9,7 @@ export const config = {
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
-// LINEに返信
+// LINEに返信（1回のみ）
 function replyToLine(replyToken, text) {
   const body = JSON.stringify({
     replyToken,
@@ -71,7 +71,7 @@ async function analyzeFood(base64Image) {
       {
         role: "user",
         content: [
-          { type: "text", text: "この料理名とおおよそのカロリー(kcal)を教えてください。簡潔に。" },
+          { type: "text", text: "この料理名とおおよそのカロリー(kcal)を簡潔に教えてください。" },
           {
             type: "image_url",
             image_url: {
@@ -118,10 +118,7 @@ export default async function handler(req, res) {
     const event = req.body.events?.[0];
     if (!event) return res.status(200).json({});
 
-    // 📸 画像メッセージ
     if (event.type === "message" && event.message.type === "image") {
-      await replyToLine(event.replyToken, "解析中です…🍽️");
-
       const base64Image = await getLineImage(event.message.id);
       const result = await analyzeFood(base64Image);
 
