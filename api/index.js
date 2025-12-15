@@ -1,5 +1,3 @@
-import fetch from "node-fetch";
-
 const LINE_REPLY_API = "https://api.line.me/v2/bot/message/reply";
 
 export default async function handler(req, res) {
@@ -14,21 +12,17 @@ export default async function handler(req, res) {
     const replyToken = event.replyToken;
     const message = event.message;
 
-    // =========================
-    // テキストメッセージ
-    // =========================
+    // ========= テキスト =========
     if (message.type === "text") {
       await reply(replyToken, `受信しました 👍\n「${message.text}」`);
       return res.status(200).json({ ok: true });
     }
 
-    // =========================
-    // 画像メッセージ
-    // =========================
+    // ========= 画像 =========
     if (message.type === "image") {
       await reply(replyToken, "📸 解析中です…少しお待ちください");
 
-      // 画像取得
+      // LINE画像取得
       const imageRes = await fetch(
         `https://api-data.line.me/v2/bot/message/${message.id}/content`,
         {
@@ -41,7 +35,7 @@ export default async function handler(req, res) {
       const imageBuffer = await imageRes.arrayBuffer();
       const base64Image = Buffer.from(imageBuffer).toString("base64");
 
-      // OpenAI API
+      // OpenAI Vision
       const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -54,14 +48,8 @@ export default async function handler(req, res) {
             {
               role: "user",
               content: [
-                {
-                  type: "input_text",
-                  text: "この食事の内容とカロリーを日本語で推定してください",
-                },
-                {
-                  type: "input_image",
-                  image_base64: base64Image,
-                },
+                { type: "input_text", text: "料理内容とカロリーを日本語で推定してください" },
+                { type: "input_image", image_base64: base64Image },
               ],
             },
           ],
@@ -72,8 +60,8 @@ export default async function handler(req, res) {
       console.log("AI FULL RESPONSE:", JSON.stringify(aiJson, null, 2));
 
       const result =
-        aiJson.output?.[0]?.content?.[0]?.text ||
-        "解析に失敗しました（AIの解析結果が取得できませんでした）";
+        aiJson.output?.[0]?.content?.[0]?.text ??
+        "解析に失敗しました（画像が不明瞭な可能性があります）";
 
       await reply(replyToken, `🍽 推定結果\n\n${result}`);
     }
@@ -85,9 +73,6 @@ export default async function handler(req, res) {
   }
 }
 
-// =========================
-// LINE返信関数
-// =========================
 async function reply(replyToken, text) {
   await fetch(LINE_REPLY_API, {
     method: "POST",
