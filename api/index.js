@@ -6,8 +6,6 @@ export const config = {
   },
 };
 
-const LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply";
-
 function replyToLine(replyToken, text) {
   const body = JSON.stringify({
     replyToken,
@@ -58,16 +56,22 @@ export default async function handler(req, res) {
 
     const event = events[0];
 
-    if (event.type !== "message" || event.message.type !== "text") {
-      return res.status(200).json({ status: "ignored" });
+    // 📸 画像メッセージ
+    if (event.type === "message" && event.message.type === "image") {
+      await replyToLine(event.replyToken, "写真を受信しました 📸");
+      return res.status(200).json({ status: "image received" });
     }
 
-    const replyToken = event.replyToken;
-    const userText = event.message.text;
+    // ✍️ テキストメッセージ
+    if (event.type === "message" && event.message.type === "text") {
+      await replyToLine(
+        event.replyToken,
+        `受信しました 👍\n「${event.message.text}」`
+      );
+      return res.status(200).json({ status: "text received" });
+    }
 
-    await replyToLine(replyToken, `受信しました 👍\n「${userText}」`);
-
-    return res.status(200).json({ status: "replied" });
+    return res.status(200).json({ status: "ignored" });
 
   } catch (err) {
     console.error("ERROR:", err);
