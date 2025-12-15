@@ -5,8 +5,18 @@ export const config = {
 export default async function handler(req, res) {
   try {
     const event = req.body?.events?.[0];
-    if (!event) {
-      return res.status(200).send("OK");
+    if (!event) return res.status(200).send("OK");
+
+    let replyText = "❓ 未対応のメッセージです";
+
+    if (event.type === "message") {
+      if (event.message.type === "text") {
+        replyText = `✉️ テキスト受信：${event.message.text}`;
+      }
+
+      if (event.message.type === "image") {
+        replyText = "📸 画像を受信しました";
+      }
     }
 
     await fetch("https://api.line.me/v2/bot/message/reply", {
@@ -17,18 +27,13 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         replyToken: event.replyToken,
-        messages: [
-          {
-            type: "text",
-            text: "✅ Webhook 正常に動いています",
-          },
-        ],
+        messages: [{ type: "text", text: replyText }],
       }),
     });
 
     return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error("ERROR", e);
+    console.error(e);
     return res.status(200).json({ error: e.message });
   }
 }
