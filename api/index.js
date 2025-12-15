@@ -15,10 +15,9 @@ export default async function handler(req, res) {
 
     // ===== 画像 =====
     if (event.message?.type === "image") {
-      // ① 即レス
       await reply(event.replyToken, "📸 解析中です…少しお待ちください");
 
-      // ② LINE画像取得
+      // LINE画像取得
       const imageRes = await fetch(
         `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
         {
@@ -31,7 +30,7 @@ export default async function handler(req, res) {
       const buffer = await imageRes.arrayBuffer();
       const base64Image = Buffer.from(buffer).toString("base64");
 
-      // ③ OpenAI Vision（正しい形式）
+      // OpenAI Vision（最安定構成）
       const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -43,27 +42,28 @@ export default async function handler(req, res) {
           input: [
             {
               role: "user",
-              content: [
-                {
-                  type: "input_text",
-                  text: "この食事内容を日本語で簡潔に説明し、合計カロリー（kcal）を概算してください。",
-                },
-                {
-                  type: "input_image",
-                  image_url: `data:image/jpeg;base64,${base64Image}`,
-                },
-              ],
+              content: {
+                type: "input_text",
+                text: "この食事の内容を日本語で簡潔に説明し、合計カロリー（kcal）を概算してください。",
+              },
+            },
+            {
+              role: "user",
+              content: {
+                type: "input_image",
+                image_url: `data:image/jpeg;base64,${base64Image}`,
+              },
             },
           ],
         }),
       });
 
       const aiJson = await aiRes.json();
-      console.log("AI RAW:", JSON.stringify(aiJson));
+      console.log("AI FULL RESPONSE:", JSON.stringify(aiJson, null, 2));
 
       const result =
-        aiJson.output_text ??
-        "解析に失敗しました（再度お試しください）";
+        aiJson.output_text ||
+        "解析に失敗しました（OpenAIから応答なし）";
 
       await pushMessage(
         event.source.userId,
