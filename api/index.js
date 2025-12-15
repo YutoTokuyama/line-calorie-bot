@@ -1,9 +1,7 @@
 const LINE_REPLY_API = "https://api.line.me/v2/bot/message/reply";
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
-  }
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
     const event = req.body.events?.[0];
@@ -22,20 +20,10 @@ export default async function handler(req, res) {
     if (message.type === "image") {
       await reply(replyToken, "📸 解析中です…少しお待ちください");
 
-      // LINE画像取得
-      const imageRes = await fetch(
-        `https://api-data.line.me/v2/bot/message/${message.id}/content`,
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-          },
-        }
-      );
+      // LINEの画像URLを直接使用（CDN URL）
+      const imageUrl = `https://api-data.line.me/v2/bot/message/${message.id}/content`;
 
-      const imageBuffer = await imageRes.arrayBuffer();
-      const base64Image = Buffer.from(imageBuffer).toString("base64");
-
-      // OpenAI Vision
+      // OpenAI API
       const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -48,8 +36,14 @@ export default async function handler(req, res) {
             {
               role: "user",
               content: [
-                { type: "input_text", text: "料理内容とカロリーを日本語で推定してください" },
-                { type: "input_image", image_base64: base64Image },
+                {
+                  type: "input_text",
+                  text: "この食事の内容とカロリーを日本語で推定してください。",
+                },
+                {
+                  type: "input_image",
+                  image_url: imageUrl,
+                },
               ],
             },
           ],
@@ -60,7 +54,7 @@ export default async function handler(req, res) {
       console.log("AI FULL RESPONSE:", JSON.stringify(aiJson, null, 2));
 
       const result =
-        aiJson.output?.[0]?.content?.[0]?.text ??
+        aiJson.output?.[0]?.content?.[0]?.text ||
         "解析に失敗しました（画像が不明瞭な可能性があります）";
 
       await reply(replyToken, `🍽 推定結果\n\n${result}`);
@@ -73,6 +67,7 @@ export default async function handler(req, res) {
   }
 }
 
+// LINE返信関数
 async function reply(replyToken, text) {
   await fetch(LINE_REPLY_API, {
     method: "POST",
