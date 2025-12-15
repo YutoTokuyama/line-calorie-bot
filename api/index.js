@@ -15,9 +15,10 @@ export default async function handler(req, res) {
 
     // ===== 画像 =====
     if (event.message?.type === "image") {
+      // ① 即レス
       await reply(event.replyToken, "📸 解析中です…少しお待ちください");
 
-      // LINE画像取得
+      // ② LINE画像取得
       const imageRes = await fetch(
         `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
         {
@@ -30,7 +31,7 @@ export default async function handler(req, res) {
       const buffer = await imageRes.arrayBuffer();
       const base64Image = Buffer.from(buffer).toString("base64");
 
-      // OpenAI Vision（最安定構成）
+      // ③ OpenAI Vision（正しい Responses API 形式）
       const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -42,17 +43,21 @@ export default async function handler(req, res) {
           input: [
             {
               role: "user",
-              content: {
-                type: "input_text",
-                text: "この食事の内容を日本語で簡潔に説明し、合計カロリー（kcal）を概算してください。",
-              },
+              content: [
+                {
+                  type: "input_text",
+                  text: "この食事の内容を日本語で簡潔に説明し、合計カロリー（kcal）を概算してください。",
+                },
+              ],
             },
             {
               role: "user",
-              content: {
-                type: "input_image",
-                image_url: `data:image/jpeg;base64,${base64Image}`,
-              },
+              content: [
+                {
+                  type: "input_image",
+                  image_url: `data:image/jpeg;base64,${base64Image}`,
+                },
+              ],
             },
           ],
         }),
@@ -63,7 +68,7 @@ export default async function handler(req, res) {
 
       const result =
         aiJson.output_text ||
-        "解析に失敗しました（OpenAIから応答なし）";
+        "解析に失敗しました（OpenAI応答なし）";
 
       await pushMessage(
         event.source.userId,
@@ -80,7 +85,7 @@ export default async function handler(req, res) {
   }
 }
 
-// ===== 共通 =====
+// ===== 共通関数 =====
 async function reply(replyToken, text) {
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
