@@ -15,7 +15,7 @@ export default async function handler(req, res) {
 
     // ===== 画像 =====
     if (event.message?.type === "image") {
-      // ① まず「解析中」を即返す
+      // ① 解析中を即返す
       await reply(event.replyToken, "📸 解析中です…少しお待ちください");
 
       // ② LINEから画像取得
@@ -31,28 +31,26 @@ export default async function handler(req, res) {
       const buffer = await imageRes.arrayBuffer();
       const base64Image = Buffer.from(buffer).toString("base64");
 
-      // ③ OpenAI Vision
-      const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      // ③ OpenAI Responses API（Vision対応）
+      const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         },
         body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [
+          model: "gpt-4.1-mini",
+          input: [
             {
               role: "user",
               content: [
                 {
-                  type: "text",
-                  text: "この食事の内容を日本語で簡潔に推定し、合計カロリー（kcal）を概算してください。",
+                  type: "input_text",
+                  text: "この食事の内容を日本語で簡潔に説明し、合計カロリー（kcal）を概算してください。",
                 },
                 {
-                  type: "image_url",
-                  image_url: {
-                    url: `data:image/jpeg;base64,${base64Image}`,
-                  },
+                  type: "input_image",
+                  image_base64: base64Image,
                 },
               ],
             },
@@ -61,19 +59,24 @@ export default async function handler(req, res) {
       });
 
       const aiJson = await aiRes.json();
-      const result =
-        aiJson.choices?.[0]?.message?.content ??
-        "解析できませんでした";
+      console.log("AI response:", JSON.stringify(aiJson));
 
-      // ④ 結果を push（replyTokenは1回限りなので push）
-      await pushMessage(event.source.userId, `🍽 推定結果\n\n${result}`);
+      const result =
+        aiJson.output_text ||
+        "解析に失敗しました（画像が不明瞭な可能性があります）";
+
+      // ④ pushで結果送信
+      await pushMessage(
+        event.source.userId,
+        `🍽 推定結果\n\n${result}`
+      );
 
       return res.status(200).json({ ok: true });
     }
 
     return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error(e);
+    console.error("ERROR:", e);
     return res.status(200).json({ error: e.message });
   }
 }
