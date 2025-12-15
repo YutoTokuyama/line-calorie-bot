@@ -1,77 +1,37 @@
-import https from "https";
+import fetch from "node-fetch";
+import OpenAI from "openai";
 
-export const config = {
-  api: {
-    bodyParser: true,
-  },
-};
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-
-// LINEに返信（1回のみ）
-function replyToLine(replyToken, text) {
-  const body = JSON.stringify({
-    replyToken,
-    messages: [{ type: "text", text }],
-  });
-
-  const options = {
-    hostname: "api.line.me",
-    path: "/v2/bot/message/reply",
+// LINEに返信する関数
+async function replyToLine(replyToken, text) {
+  await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(body),
-      "Authorization": `Bearer ${LINE_TOKEN}`,
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
     },
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, res => {
-      res.on("data", () => {});
-      res.on("end", resolve);
-    });
-    req.on("error", reject);
-    req.write(body);
-    req.end();
+    body: JSON.stringify({
+      replyToken,
+      messages: [{ type: "text", text }],
+    }),
   });
 }
 
-// LINE画像取得
-function getLineImage(messageId) {
-  const options = {
-    hostname: "api.line.me",
-    path: `/v2/bot/message/${messageId}/content`,
-    method: "GET",
-    headers: {
-      "Authorization": `Bearer ${LINE_TOKEN}`,
-    },
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, res => {
-      const chunks = [];
-      res.on("data", chunk => chunks.push(chunk));
-      res.on("end", () => {
-        const buffer = Buffer.concat(chunks);
-        resolve(buffer.toString("base64"));
-      });
-    });
-    req.on("error", reject);
-    req.end();
-  });
-}
-
-// OpenAI Vision
+// 画像からカロリー推定
 async function analyzeFood(base64Image) {
-  const body = JSON.stringify({
-    model: "gpt-4o-mini",
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
     messages: [
       {
         role: "user",
         content: [
-          { type: "text", text: "この料理名とおおよそのカロリー(kcal)を簡潔に教えてください。" },
+          {
+            type: "text",
+            text: "この料理の内容とカロリーを日本語で簡潔に推定してください。",
+          },
           {
             type: "image_url",
             image_url: {
@@ -81,56 +41,73 @@ async function analyzeFood(base64Image) {
         ],
       },
     ],
+    max_tokens: 300,
   });
 
-  const options = {
-    hostname: "api.openai.com",
-    path: "/v1/chat/completions",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(body),
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-    },
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, res => {
-      let data = "";
-      res.on("data", chunk => (data += chunk));
-      res.on("end", () => {
-        const json = JSON.parse(data);
-        resolve(json.choices[0].message.content);
-      });
-    });
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
+  return response.choices[0].message.content;
 }
 
 export default async function handler(req, res) {
   try {
+    // Webhook検証用
     if (req.method === "GET") {
       return res.status(200).send("OK");
     }
 
     const event = req.body.events?.[0];
-    if (!event) return res.status(200).json({});
+    if (!event) {
+      return res.status(200).json({ message: "No event" });
+    }
 
+    // テキストメッセージ
+    if (event.type === "message" && event.message.type === "text") {
+      await replyToLine(
+        event.replyToken,
+        `受信しました 👍\n「${event.message.text}」`
+      );
+      return res.status(200).json({ status: "ok" });
+    }
+
+    // 画像メッセージ
     if (event.type === "message" && event.message.type === "image") {
-      const base64Image = await getLineImage(event.message.id);
+      await replyToLine(event.replyToken, "📸 解析中です…少しお待ちください");
+
+      const imageRes = await fetch(
+        `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+          },
+        }
+      );
+
+      const buffer = await imageRes.arrayBuffer();
+      const base64Image = Buffer.from(buffer).toString("base64");
+
       const result = await analyzeFood(base64Image);
 
       await replyToLine(
         event.replyToken,
-        `🍴 推定結果\n${result}`
+        `🍴 推定結果\n\n${result}`
       );
+
+      return res.status(200).json({ status: "ok" });
     }
 
-    return res.status(200).json({ status: "ok" });
+    return res.status(200).json({ status: "ignored" });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message });
+    console.error("ERROR:", err);
+
+    try {
+      const event = req.body.events?.[0];
+      if (event?.replyToken) {
+        await replyToLine(
+          event.replyToken,
+          "⚠️ 解析中にエラーが発生しました。時間をおいて再度お試しください。"
+        );
+      }
+    } catch (_) {}
+
+    return res.status(200).json({ error: err.message });
   }
 }
