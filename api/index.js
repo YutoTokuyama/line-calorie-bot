@@ -4,7 +4,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// LINEに返信
+// reply（1回だけ）
 async function reply(replyToken, text) {
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -19,7 +19,22 @@ async function reply(replyToken, text) {
   });
 }
 
-// 画像からカロリー推定
+// push（何回でもOK）
+async function push(userId, text) {
+  await fetch("https://api.line.me/v2/bot/message/push", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({
+      to: userId,
+      messages: [{ type: "text", text }],
+    }),
+  });
+}
+
+// 画像解析
 async function analyzeFood(base64Image) {
   const res = await openai.chat.completions.create({
     model: "gpt-4o",
@@ -30,7 +45,7 @@ async function analyzeFood(base64Image) {
           {
             type: "text",
             text:
-              "この料理の内容を特定し、推定カロリーをkcalで日本語で簡潔に出してください。可能なら料理名も。",
+              "この料理の内容と推定カロリーを日本語で簡潔に教えてください。",
           },
           {
             type: "image_url",
@@ -58,7 +73,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // テキストはそのまま返す
+    // テキスト
     if (event.message?.type === "text") {
       await reply(
         event.replyToken,
@@ -69,7 +84,7 @@ export default async function handler(req, res) {
 
     // 画像
     if (event.message?.type === "image") {
-      // ① 解析中
+      // ① 先に reply（1回だけ）
       await reply(event.replyToken, "📸 解析中です…少しお待ちください");
 
       // ② 画像取得
@@ -88,9 +103,9 @@ export default async function handler(req, res) {
       // ③ OpenAI解析
       const result = await analyzeFood(base64Image);
 
-      // ④ 結果返信
-      await reply(
-        event.replyToken,
+      // ④ push で結果送信
+      await push(
+        event.source.userId,
         `🍴 推定結果\n\n${result}`
       );
 
@@ -100,15 +115,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error("ERROR:", e);
-    try {
-      const event = req.body?.events?.[0];
-      if (event?.replyToken) {
-        await reply(
-          event.replyToken,
-          "⚠️ エラーが発生しました。時間をおいて再度お試しください。"
-        );
-      }
-    } catch (_) {}
     return res.status(200).json({ error: e.message });
   }
 }
