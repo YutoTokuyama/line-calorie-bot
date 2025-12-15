@@ -1,11 +1,10 @@
-import fetch from "node-fetch";
 import OpenAI from "openai";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// LINEに返信する関数
+// LINEに返信
 async function replyToLine(replyToken, text) {
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -20,7 +19,7 @@ async function replyToLine(replyToken, text) {
   });
 }
 
-// 画像からカロリー推定
+// 画像解析
 async function analyzeFood(base64Image) {
   const response = await openai.chat.completions.create({
     model: "gpt-4o",
@@ -28,10 +27,7 @@ async function analyzeFood(base64Image) {
       {
         role: "user",
         content: [
-          {
-            type: "text",
-            text: "この料理の内容とカロリーを日本語で簡潔に推定してください。",
-          },
+          { type: "text", text: "この料理の内容とカロリーを日本語で簡潔に推定してください。" },
           {
             type: "image_url",
             image_url: {
@@ -49,28 +45,27 @@ async function analyzeFood(base64Image) {
 
 export default async function handler(req, res) {
   try {
-    // Webhook検証用
     if (req.method === "GET") {
       return res.status(200).send("OK");
     }
 
-    const event = req.body.events?.[0];
+    const event = req.body?.events?.[0];
     if (!event) {
-      return res.status(200).json({ message: "No event" });
+      return res.status(200).json({ ok: true });
     }
 
-    // テキストメッセージ
-    if (event.type === "message" && event.message.type === "text") {
+    // テキスト
+    if (event.message?.type === "text") {
       await replyToLine(
         event.replyToken,
         `受信しました 👍\n「${event.message.text}」`
       );
-      return res.status(200).json({ status: "ok" });
+      return res.status(200).json({ ok: true });
     }
 
-    // 画像メッセージ
-    if (event.type === "message" && event.message.type === "image") {
-      await replyToLine(event.replyToken, "📸 解析中です…少しお待ちください");
+    // 画像
+    if (event.message?.type === "image") {
+      await replyToLine(event.replyToken, "📸 解析中です…");
 
       const imageRes = await fetch(
         `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
@@ -86,28 +81,13 @@ export default async function handler(req, res) {
 
       const result = await analyzeFood(base64Image);
 
-      await replyToLine(
-        event.replyToken,
-        `🍴 推定結果\n\n${result}`
-      );
-
-      return res.status(200).json({ status: "ok" });
+      await replyToLine(event.replyToken, `🍴 推定結果\n\n${result}`);
+      return res.status(200).json({ ok: true });
     }
 
-    return res.status(200).json({ status: "ignored" });
+    return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("ERROR:", err);
-
-    try {
-      const event = req.body.events?.[0];
-      if (event?.replyToken) {
-        await replyToLine(
-          event.replyToken,
-          "⚠️ 解析中にエラーが発生しました。時間をおいて再度お試しください。"
-        );
-      }
-    } catch (_) {}
-
     return res.status(200).json({ error: err.message });
   }
 }
