@@ -1,26 +1,36 @@
-export const config = {
-  runtime: "nodejs",
-};
+import fetch from "node-fetch";
+
+const LINE_REPLY_API = "https://api.line.me/v2/bot/message/reply";
 
 export default async function handler(req, res) {
-  try {
-    const event = req.body?.events?.[0];
-    if (!event) return res.status(200).send("OK");
+  if (req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed");
+  }
 
-    // ===== テキスト =====
-    if (event.message?.type === "text") {
-      await reply(event.replyToken, `受信しました 👍\n「${event.message.text}」`);
+  try {
+    const event = req.body.events?.[0];
+    if (!event) return res.status(200).json({ ok: true });
+
+    const replyToken = event.replyToken;
+    const message = event.message;
+
+    // =========================
+    // テキストメッセージ
+    // =========================
+    if (message.type === "text") {
+      await reply(replyToken, `受信しました 👍\n「${message.text}」`);
       return res.status(200).json({ ok: true });
     }
 
-    // ===== 画像 =====
-    if (event.message?.type === "image") {
-      // ① 即レス
-      await reply(event.replyToken, "📸 解析中です…少しお待ちください");
+    // =========================
+    // 画像メッセージ
+    // =========================
+    if (message.type === "image") {
+      await reply(replyToken, "📸 解析中です…少しお待ちください");
 
-      // ② LINE画像取得
+      // 画像取得
       const imageRes = await fetch(
-        `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
+        `https://api-data.line.me/v2/bot/message/${message.id}/content`,
         {
           headers: {
             Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
@@ -28,10 +38,10 @@ export default async function handler(req, res) {
         }
       );
 
-      const buffer = await imageRes.arrayBuffer();
-      const base64Image = Buffer.from(buffer).toString("base64");
+      const imageBuffer = await imageRes.arrayBuffer();
+      const base64Image = Buffer.from(imageBuffer).toString("base64");
 
-      // ③ OpenAI Vision（正しい Responses API 形式）
+      // OpenAI API
       const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -46,16 +56,11 @@ export default async function handler(req, res) {
               content: [
                 {
                   type: "input_text",
-                  text: "この食事の内容を日本語で簡潔に説明し、合計カロリー（kcal）を概算してください。",
+                  text: "この食事の内容とカロリーを日本語で推定してください",
                 },
-              ],
-            },
-            {
-              role: "user",
-              content: [
                 {
                   type: "input_image",
-                  image_url: `data:image/jpeg;base64,${base64Image}`,
+                  image_base64: base64Image,
                 },
               ],
             },
@@ -67,27 +72,24 @@ export default async function handler(req, res) {
       console.log("AI FULL RESPONSE:", JSON.stringify(aiJson, null, 2));
 
       const result =
-        aiJson.output_text ||
-        "解析に失敗しました（OpenAI応答なし）";
+        aiJson.output?.[0]?.content?.[0]?.text ||
+        "解析に失敗しました（AIの解析結果が取得できませんでした）";
 
-      await pushMessage(
-        event.source.userId,
-        `🍽 推定結果\n\n${result}`
-      );
-
-      return res.status(200).json({ ok: true });
+      await reply(replyToken, `🍽 推定結果\n\n${result}`);
     }
 
     return res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error("ERROR:", e);
-    return res.status(200).json({ error: e.message });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send("Internal Server Error");
   }
 }
 
-// ===== 共通関数 =====
+// =========================
+// LINE返信関数
+// =========================
 async function reply(replyToken, text) {
-  await fetch("https://api.line.me/v2/bot/message/reply", {
+  await fetch(LINE_REPLY_API, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -95,20 +97,6 @@ async function reply(replyToken, text) {
     },
     body: JSON.stringify({
       replyToken,
-      messages: [{ type: "text", text }],
-    }),
-  });
-}
-
-async function pushMessage(userId, text) {
-  await fetch("https://api.line.me/v2/bot/message/push", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-    },
-    body: JSON.stringify({
-      to: userId,
       messages: [{ type: "text", text }],
     }),
   });
