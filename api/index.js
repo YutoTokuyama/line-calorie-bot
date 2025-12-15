@@ -15,10 +15,10 @@ export default async function handler(req, res) {
 
     // ===== 画像 =====
     if (event.message?.type === "image") {
-      // ① 解析中を即返す
+      // ① 即レス
       await reply(event.replyToken, "📸 解析中です…少しお待ちください");
 
-      // ② LINEから画像取得
+      // ② LINE画像取得
       const imageRes = await fetch(
         `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
         {
@@ -31,7 +31,7 @@ export default async function handler(req, res) {
       const buffer = await imageRes.arrayBuffer();
       const base64Image = Buffer.from(buffer).toString("base64");
 
-      // ③ OpenAI Responses API（Vision対応）
+      // ③ OpenAI Vision（正しい形式）
       const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -46,11 +46,11 @@ export default async function handler(req, res) {
               content: [
                 {
                   type: "input_text",
-                  text: "この食事の内容を日本語で簡潔に説明し、合計カロリー（kcal）を概算してください。",
+                  text: "この食事内容を日本語で簡潔に説明し、合計カロリー（kcal）を概算してください。",
                 },
                 {
                   type: "input_image",
-                  image_base64: base64Image,
+                  image_url: `data:image/jpeg;base64,${base64Image}`,
                 },
               ],
             },
@@ -59,13 +59,12 @@ export default async function handler(req, res) {
       });
 
       const aiJson = await aiRes.json();
-      console.log("AI response:", JSON.stringify(aiJson));
+      console.log("AI RAW:", JSON.stringify(aiJson));
 
       const result =
-        aiJson.output_text ||
-        "解析に失敗しました（画像が不明瞭な可能性があります）";
+        aiJson.output_text ??
+        "解析に失敗しました（再度お試しください）";
 
-      // ④ pushで結果送信
       await pushMessage(
         event.source.userId,
         `🍽 推定結果\n\n${result}`
@@ -81,7 +80,7 @@ export default async function handler(req, res) {
   }
 }
 
-// ===== 共通関数 =====
+// ===== 共通 =====
 async function reply(replyToken, text) {
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
