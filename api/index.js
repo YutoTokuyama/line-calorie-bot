@@ -12,7 +12,8 @@ export default async function handler(req, res) {
     const userText = event.message.text;
 
     try {
-      const aiRes = await fetch("https://api.openai.com/v1/responses", {
+      // 判定
+      const judgeRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -21,22 +22,19 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           model: "gpt-4.1-mini",
           input: `
-次のテキストが「料理名または食材名」かどうかを判定してください。
-
-・料理/食材なら → YES
-・それ以外なら → NO
+次のテキストが料理名または食材名かどうかを判定してください。
+料理・食材なら YES、それ以外は NO だけで答えてください。
 
 テキスト: ${userText}
           `,
         }),
       });
 
-      const aiData = await aiRes.json();
-      const judge = extractText(aiData)?.trim();
+      const judgeData = await judgeRes.json();
+      const judge = extractText(judgeData)?.trim();
 
       if (judge === "YES") {
-        // カロリー推定
-        const kcalRes = await fetch("https://api.openai.com/v1/responses", {
+        const aiRes = await fetch("https://api.openai.com/v1/responses", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -44,18 +42,41 @@ export default async function handler(req, res) {
           },
           body: JSON.stringify({
             model: "gpt-4.1-mini",
-            input: `${userText} の目安カロリーとPFC（たんぱく質g・脂質g・炭水化物g）を日本語で分かりやすく教えてください`,
+            input: `
+以下の料理または食材について、必ず次の形式で出力してください。
+記号や装飾は使ってOKですが、Markdown記法（#, **, | など）は使わないでください。
+
+【出力形式】
+
+🍽 推定結果（目安）
+
+料理：◯◯◯
+
+🔥 カロリー
+約 xxx kcal
+
+🥗 PFCバランス
+・たんぱく質：xx g
+・脂質：xx g
+・炭水化物：xx g
+
+✅ ポイント
+栄養面や食べ方について一言コメントしてください。
+
+料理・食材名：
+${userText}
+            `,
           }),
         });
 
-        const kcalData = await kcalRes.json();
-        const kcalText = extractText(kcalData) || "推定できませんでした";
+        const aiData = await aiRes.json();
+        const text = extractText(aiData) || "解析できませんでした";
 
-        await reply(replyToken, `🍽 推定結果\n${kcalText}`);
+        await reply(replyToken, text);
       } else {
         await reply(
           replyToken,
-          "料理や食材をテキストか写真で送ると目安カロリーを知ることができます 📸🍽"
+          "料理や食材をテキストか写真で送ると目安カロリーとPFCを知ることができます 📸🍽"
         );
       }
     } catch (e) {
@@ -66,7 +87,7 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  /* ===== 画像（今まで通り） ===== */
+  /* ===== 画像 ===== */
   if (event.message.type === "image") {
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
@@ -105,7 +126,28 @@ export default async function handler(req, res) {
             {
               role: "user",
               content: [
-                { type: "input_text", text: "料理名と目安カロリーとPFC（たんぱく質g・脂質g・炭水化物g）を日本語で分かりやすく教えてください" },
+                {
+                  type: "input_text",
+                  text: `
+この料理の内容を分析し、以下の形式で出力してください。
+Markdownは使わないでください。
+
+🍽 推定結果（目安）
+
+料理：
+
+🔥 カロリー
+約 xxx kcal
+
+🥗 PFCバランス
+・たんぱく質：xx g
+・脂質：xx g
+・炭水化物：xx g
+
+✅ ポイント
+栄養面について一言コメント
+                  `,
+                },
                 { type: "input_image", image_url: imageUrl },
               ],
             },
@@ -116,7 +158,7 @@ export default async function handler(req, res) {
       const aiData = await aiRes.json();
       const text = extractText(aiData) || "解析できませんでした";
 
-      await push(userId, `🍽 推定結果\n${text}`);
+      await push(userId, text);
     } catch (e) {
       console.error(e);
       await push(userId, "❌ 解析に失敗しました");
