@@ -69,7 +69,7 @@ export default async function handler(req, res) {
       }
 
       const result = await openai(
-        `${text} のカロリーとPFC（たんぱく質・脂質・炭水化物）を数値で推定してください。可能なら合計も含めてください。`
+        `${text} のカロリーとPFC（たんぱく質・脂質・炭水化物）を数値で推定してください。簡潔に。`
       );
 
       await reply(replyToken, result ? `🍽 推定結果（目安）\n\n${result}` : "解析できませんでした");
@@ -105,6 +105,7 @@ export default async function handler(req, res) {
       const upJson = await up.json();
       const imageUrl = upJson.secure_url;
 
+      // ★ここが重要：JSON固定で返させる
       const ai = await openaiJson([
         {
           role: "user",
@@ -112,32 +113,23 @@ export default async function handler(req, res) {
             {
               type: "input_text",
               text: `
-写真に写っている料理・食材をすべて特定してください（複数前提）。
-Markdown記法は禁止です。
+あなたは栄養計算アシスタントです。画像から料理・食材をできるだけ特定し、推定のカロリーとPFCを出してください。
+出力は「JSONのみ」。前後に説明文やコードブロックは禁止です（JSON以外の文字を出さない）。
 
-必ずこの形式で出力してください（合計は一番上）：
+【JSONスキーマ（厳守）】
+{
+  "total": { "kcal": number, "p": number, "f": number, "c": number },
+  "items": [
+    { "name": string, "kcal": number, "p": number, "f": number, "c": number }
+  ],
+  "point": string
+}
 
-🍽 推定結果（目安）
-
-🔥 合計
-カロリー：約 xxx kcal
-PFC
-・たんぱく質：xx g
-・脂質：xx g
-・炭水化物：xx g
-
-――――――――――
-① 料理名
-カロリー：約 xxx kcal
-PFC
-・たんぱく質：xx g
-・脂質：xx g
-・炭水化物：xx g
-
-② …（あるだけ続ける）
-
-✅ ポイント
-全体の栄養バランスについて一言コメント
+ルール：
+- itemsには合計を入れない（"合計"や"総計"はitemsに含めない）
+- itemsは画像内に写っている料理/食材の数だけ入れる
+- totalはitemsの合計と整合する値にする
+- 推定でOK。数値は現実的な範囲にする
               `.trim(),
             },
             { type: "input_image", image_url: imageUrl },
@@ -148,12 +140,10 @@ PFC
       const parsed = parseMultiFood(ai);
       const message = formatImageResult(parsed);
 
-      // 結果は push で送る（replyTokenはもう使わない）
-      if (userId) {
-        await push(userId, message);
-      }
+      // 結果は push で送る
+      if (userId) await push(userId, message);
 
-      // 各料理を1行ずつ保存
+      // itemsだけ保存（totalは保存しない）
       for (const f of parsed.items) {
         await saveLog(userId, f.name, f, today);
       }
@@ -238,46 +228,65 @@ function extractText(ai) {
   return null;
 }
 
-/**
- * OpenAIの返答から、料理行を「名前:kcal P F C」っぽく抽出する簡易パーサ
- * （まずは動く最小。必要なら精度UP版に改良できます）
- */
+// ★JSON固定を優先。失敗したら最低限のフォールバック
 function parseMultiFood(ai) {
-  const t = extractText(ai) || "";
-  const items = [];
+  const raw = extractText(ai) || "";
+  const parsedJson = tryParseJson(raw);
 
-  // ①〜 のブロックから数値を拾う（ゆるめ）
-  const blocks = t.split(/\n(?=①|②|③|④|⑤|⑥|⑦|⑧|⑨)/).map(x => x.trim()).filter(Boolean);
-  for (const b of blocks) {
-    const lines = b.split("\n").map(x => x.trim()).filter(Boolean);
-    const nameLine = lines[0] || "";
-    const name = nameLine.replace(/^[①-⑨]\s*/, "").replace(/^[①-⑨]/, "").trim();
-    const nums = b.match(/([\d.]+)\s*(kcal|g)?/gi) || [];
-    // 想定：kcal, P, F, C の順に出ることが多い
-    const onlyNums = (b.match(/([\d.]+)/g) || []).map(Number);
-    if (name && onlyNums.length >= 4) {
-      items.push({ name, kcal: onlyNums[0], p: onlyNums[1], f: onlyNums[2], c: onlyNums[3] });
-    }
+  if (parsedJson && parsedJson.items && parsedJson.total) {
+    // itemsに合計が混ざらないよう二重ガード
+    const items = (parsedJson.items || [])
+      .filter(x => x && x.name && !/合計|総計/i.test(String(x.name)))
+      .map(x => ({
+        name: String(x.name),
+        kcal: Number(x.kcal || 0),
+        p: Number(x.p || 0),
+        f: Number(x.f || 0),
+        c: Number(x.c || 0),
+      }));
+
+    const total = {
+      kcal: Number(parsedJson.total.kcal || 0),
+      p: Number(parsedJson.total.p || 0),
+      f: Number(parsedJson.total.f || 0),
+      c: Number(parsedJson.total.c || 0),
+    };
+
+    // totalが空っぽ/不整合なら items から再計算
+    const calc = items.reduce(
+      (a, x) => (a.kcal += x.kcal, a.p += x.p, a.f += x.f, a.c += x.c, a),
+      { kcal: 0, p: 0, f: 0, c: 0 }
+    );
+    const fixedTotal =
+      total.kcal > 0 ? total : calc;
+
+    return {
+      total: fixedTotal,
+      items,
+      point: String(parsedJson.point || ""),
+      raw,
+    };
   }
 
-  // 合計は items から計算（表示は合計を上にするのでAIの合計に依存しない）
-  const total = items.reduce(
-    (acc, x) => {
-      acc.kcal += Number(x.kcal || 0);
-      acc.p += Number(x.p || 0);
-      acc.f += Number(x.f || 0);
-      acc.c += Number(x.c || 0);
-      return acc;
-    },
-    { kcal: 0, p: 0, f: 0, c: 0 }
-  );
+  // フォールバック：返答そのまま（「返ってこない」を防ぐ）
+  return { total: { kcal: 0, p: 0, f: 0, c: 0 }, items: [], point: "", raw };
+}
 
-  // itemsが空なら、AI全文をそのまま返す保険（表示用）
-  return { total, items, raw: t };
+function tryParseJson(text) {
+  try {
+    // 返答のどこかにJSONがあっても拾う
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start) return null;
+    const jsonStr = text.slice(start, end + 1);
+    return JSON.parse(jsonStr);
+  } catch {
+    return null;
+  }
 }
 
 function formatImageResult(d) {
-  // itemsが取れなかった場合は raw をそのまま返す（「返らない」を防ぐ）
+  // JSONパース失敗時は raw をそのまま返す
   if (!d.items.length) {
     return d.raw ? `🍽 推定結果（目安）\n\n${d.raw}` : "解析できませんでした";
   }
@@ -292,12 +301,13 @@ PFC
 ・脂質：${d.total.f.toFixed(1)} g
 ・炭水化物：${d.total.c.toFixed(1)} g
 
-――――――――――`;
+――――――――――
+【内訳】`;
 
   d.items.forEach((x, i) => {
     s += `
 
-${String(i + 1).padStart(1, "0")}）${x.name}
+${i + 1}) ${x.name}
 カロリー：約 ${Math.round(x.kcal)} kcal
 PFC
 ・たんぱく質：${Number(x.p).toFixed(1)} g
@@ -305,10 +315,17 @@ PFC
 ・炭水化物：${Number(x.c).toFixed(1)} g`;
   });
 
-  s += `
+  if (d.point) {
+    s += `
+
+✅ ポイント
+${d.point}`;
+  } else {
+    s += `
 
 ✅ ポイント
 量や具材で数値は変動します。必要なら「ご飯150g」「唐揚げ3個」など量も送ると精度が上がります。`;
+  }
 
   return s;
 }
@@ -326,7 +343,6 @@ async function reply(token, text) {
       messages: [{ type: "text", text }],
     }),
   });
-  // 失敗しても落とさないが、ログには残す
   if (!r.ok) console.log("LINE reply failed:", r.status, await r.text());
 }
 
