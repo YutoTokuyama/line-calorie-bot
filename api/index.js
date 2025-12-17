@@ -6,18 +6,18 @@ export default async function handler(req, res) {
 
   const replyToken = event.replyToken;
 
-  // ===== テキスト =====
+  /* ===== テキスト ===== */
   if (event.message.type === "text") {
     await reply(replyToken, `受信しました 👍\n「${event.message.text}」`);
     return res.status(200).end();
   }
 
-  // ===== 画像 =====
+  /* ===== 画像 ===== */
   if (event.message.type === "image") {
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
     try {
-      // 1️⃣ LINE画像取得
+      /* 1️⃣ LINE画像取得 */
       const imgRes = await fetch(
         `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
         {
@@ -29,7 +29,7 @@ export default async function handler(req, res) {
 
       const buffer = Buffer.from(await imgRes.arrayBuffer());
 
-      // 2️⃣ Cloudinary（unsigned upload）
+      /* 2️⃣ Cloudinary（Unsigned Upload） */
       const form = new FormData();
       form.append("file", new Blob([buffer]));
       form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
@@ -45,7 +45,7 @@ export default async function handler(req, res) {
       const cloudData = await cloudRes.json();
       const imageUrl = cloudData.secure_url;
 
-      // 3️⃣ OpenAI Vision（REST API直叩き）
+      /* 3️⃣ OpenAI Vision（REST直叩き） */
       const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -58,8 +58,15 @@ export default async function handler(req, res) {
             {
               role: "user",
               content: [
-                { type: "input_text", text: "料理名とカロリーを推定してください" },
-                { type: "input_image", image_url: imageUrl },
+                {
+                  type: "input_text",
+                  text:
+                    "この料理の名前とカロリーを推定してください。日本語で簡潔に。",
+                },
+                {
+                  type: "input_image",
+                  image_url: imageUrl,
+                },
               ],
             },
           ],
@@ -67,11 +74,12 @@ export default async function handler(req, res) {
       });
 
       const aiData = await aiRes.json();
-      const result =
-        aiData.output?.[0]?.content?.[0]?.text ||
-        "解析できませんでした";
+      const text = extractText(aiData);
 
-      await reply(replyToken, `🍽 推定結果\n${result}`);
+      await reply(
+        replyToken,
+        `🍽 推定結果\n${text || "解析できませんでした"}`
+      );
     } catch (e) {
       console.error(e);
       await reply(replyToken, "❌ 解析に失敗しました");
@@ -81,6 +89,7 @@ export default async function handler(req, res) {
   res.status(200).end();
 }
 
+/* ===== LINE返信 ===== */
 async function reply(token, text) {
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -93,4 +102,18 @@ async function reply(token, text) {
       messages: [{ type: "text", text }],
     }),
   });
+}
+
+/* ===== OpenAI text 抽出（超重要） ===== */
+function extractText(aiData) {
+  try {
+    for (const item of aiData.output || []) {
+      for (const c of item.content || []) {
+        if (c.type === "output_text" && c.text) {
+          return c.text;
+        }
+      }
+    }
+  } catch (e) {}
+  return null;
 }
