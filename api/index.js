@@ -6,8 +6,8 @@ export default async function handler(req, res) {
   const replyToken = event.replyToken;
   const userId = event.source?.userId;
 
-  // ★JSTで「今日」を作る（重要）
-  const today = getJstDate(); // YYYY-MM-DD (Asia/Tokyo)
+  // JSTで「今日」を作る（集計日ズレ防止）
+  const today = getJstDate();
 
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
@@ -59,7 +59,7 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    /* --- 料理/食材判定 --- */
+    /* --- 料理/食材判定（そのまま） --- */
     try {
       const judge = await openai(`${text} は料理名または食材名ですか？YESかNOのみで答えて`);
       if (judge !== "YES") {
@@ -70,12 +70,18 @@ export default async function handler(req, res) {
         return res.status(200).end();
       }
 
-      const result = await openai(
-        `${text} のカロリーとPFC（たんぱく質・脂質・炭水化物）を数値で推定してください。簡潔に。`
-      );
+      // ★テキストもJSON固定で返す（数値保存を安定化）
+      const ai = await openaiJsonTextFood(text);
 
-      await reply(replyToken, result ? `🍽 推定結果（目安）\n\n${result}` : "解析できませんでした");
-      await saveFromText(userId, sanitizeFoodName(text), result || "", today);
+      const parsed = parseSingleFood(ai, text);
+      const message = formatTextResult(parsed);
+
+      await reply(replyToken, message);
+
+      // 保存（料理名はサニタイズ）
+      const cleanName = sanitizeFoodName(parsed.item.name || text) || sanitizeFoodName(text);
+      await saveLog(userId, cleanName, parsed.item, today);
+
     } catch (e) {
       console.error(e);
       await reply(replyToken, "❌ エラーが発生しました");
@@ -106,6 +112,7 @@ export default async function handler(req, res) {
       const upJson = await up.json();
       const imageUrl = upJson.secure_url;
 
+      // JSON固定（合計/内訳分離）
       const ai = await openaiJson([
         {
           role: "user",
@@ -142,7 +149,7 @@ export default async function handler(req, res) {
 
       if (userId) await push(userId, message);
 
-      // ★保存前に name を必ずサニタイズ
+      // itemsだけ保存（totalは保存しない）
       for (const f of parsed.items) {
         const cleanName = sanitizeFoodName(f.name);
         if (!cleanName) continue;
@@ -178,23 +185,20 @@ function sanitizeFoodName(name) {
   if (!name) return "";
   let s = String(name);
 
-  // 改行以降は捨てる（混入防止）
   s = s.split("\n")[0];
 
-  // 料理名以外のワードが入ってたらそこで切る
   const cutWords = ["カロリー", "PFC", "たんぱく質", "脂質", "炭水化物", "推定結果", "合計", "総計"];
   for (const w of cutWords) {
     const idx = s.indexOf(w);
     if (idx > 0) s = s.slice(0, idx);
   }
 
-  // 先頭の番号や記号を除去
   s = s.replace(/^[\s]*[①-⑨0-9]+[)\]）\.．:\s-]*/g, "");
   s = s.replace(/^[\s]*[・\-–—]+/g, "");
   s = s.trim();
 
-  // 長すぎる/空は弾く
-  if (!s || s.length > 50) return s.slice(0, 50).trim();
+  if (!s) return "";
+  if (s.length > 50) return s.slice(0, 50).trim();
   return s;
 }
 
@@ -224,6 +228,41 @@ async function openaiJson(input) {
   return await r.json();
 }
 
+// ★テキスト用：JSON固定で「1品 + total + point」を返させる
+async function openaiJsonTextFood(foodText) {
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      input: `
+あなたは栄養計算アシスタントです。以下の料理/食材について、推定のカロリーとPFCを出してください。
+出力は「JSONのみ」。前後に説明文やコードブロックは禁止です（JSON以外の文字を出さない）。
+
+【JSONスキーマ（厳守）】
+{
+  "total": { "kcal": number, "p": number, "f": number, "c": number },
+  "items": [
+    { "name": string, "kcal": number, "p": number, "f": number, "c": number }
+  ],
+  "point": string
+}
+
+ルール：
+- テキストなので基本は items は1件（ただしセット内容が明確なら複数でもOK）
+- totalはitemsの合計と整合する値にする
+
+料理/食材名：
+${foodText}
+      `.trim(),
+    }),
+  });
+  return await r.json();
+}
+
 /* ===== Supabase ===== */
 async function saveLog(userId, name, f, date) {
   if (!userId) return;
@@ -245,17 +284,6 @@ async function saveLog(userId, name, f, date) {
       eaten_at: date,
     }),
   });
-}
-
-async function saveFromText(userId, name, text, date) {
-  if (!userId) return;
-  const n = (text || "").match(/([\d.]+)/g) || [];
-  await saveLog(
-    userId,
-    name,
-    { kcal: Number(n[0] || 0), p: Number(n[1] || 0), f: Number(n[2] || 0), c: Number(n[3] || 0) },
-    date
-  );
 }
 
 /* ===== utils ===== */
@@ -315,6 +343,44 @@ function parseMultiFood(ai) {
   return { total: { kcal: 0, p: 0, f: 0, c: 0 }, items: [], point: "", raw };
 }
 
+// ★テキスト用：JSONをパースし、最低1件に整える
+function parseSingleFood(ai, fallbackName) {
+  const raw = extractText(ai) || "";
+  const j = tryParseJson(raw);
+
+  if (j && j.items && j.total) {
+    const items = (j.items || [])
+      .filter(x => x && x.name && !/合計|総計/i.test(String(x.name)))
+      .map(x => ({
+        name: String(x.name),
+        kcal: Number(x.kcal || 0),
+        p: Number(x.p || 0),
+        f: Number(x.f || 0),
+        c: Number(x.c || 0),
+      }));
+
+    const first = items[0] || { name: fallbackName, kcal: 0, p: 0, f: 0, c: 0 };
+
+    // totalが空なら1件から生成
+    const total = {
+      kcal: Number(j.total.kcal || first.kcal || 0),
+      p: Number(j.total.p || first.p || 0),
+      f: Number(j.total.f || first.f || 0),
+      c: Number(j.total.c || first.c || 0),
+    };
+
+    return { total, item: first, point: String(j.point || "") };
+  }
+
+  // パース失敗時の保険（最悪でも返す）
+  return {
+    total: { kcal: 0, p: 0, f: 0, c: 0 },
+    item: { name: fallbackName, kcal: 0, p: 0, f: 0, c: 0 },
+    point: "うまく解析できませんでした。量（例：ご飯150g）も送ると精度が上がります。",
+  };
+}
+
+/* ===== 表示フォーマット ===== */
 function formatImageResult(d) {
   if (!d.items.length) return d.raw ? `🍽 推定結果（目安）\n\n${d.raw}` : "解析できませんでした";
 
@@ -348,6 +414,32 @@ PFC
 ${d.point || "量や具材で数値は変動します。必要なら量も送ると精度が上がります。"}`;
 
   return s;
+}
+
+// ★テキストも写真と同じ見た目に揃える（合計→内訳→ポイント）
+function formatTextResult(d) {
+  const name = sanitizeFoodName(d.item.name) || "（料理名不明）";
+  return `🍽 推定結果（目安）
+
+🔥 合計
+カロリー：約 ${Math.round(d.total.kcal)} kcal
+PFC
+・たんぱく質：${d.total.p.toFixed(1)} g
+・脂質：${d.total.f.toFixed(1)} g
+・炭水化物：${d.total.c.toFixed(1)} g
+
+――――――――――
+【内訳】
+
+1) ${name}
+カロリー：約 ${Math.round(d.item.kcal)} kcal
+PFC
+・たんぱく質：${Number(d.item.p).toFixed(1)} g
+・脂質：${Number(d.item.f).toFixed(1)} g
+・炭水化物：${Number(d.item.c).toFixed(1)} g
+
+✅ ポイント
+${d.point || "量や具材で数値は変動します。必要なら量も送ると精度が上がります。"}`;
 }
 
 /* ===== LINE ===== */
