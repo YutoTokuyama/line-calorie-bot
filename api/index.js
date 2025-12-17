@@ -6,90 +6,77 @@ export default async function handler(req, res) {
 
   const replyToken = event.replyToken;
   const userId = event.source?.userId;
+  const today = new Date().toISOString().slice(0, 10);
 
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
-    const userText = event.message.text;
+    const userText = event.message.text.trim();
 
-    try {
-      const judgeRes = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4.1-mini",
-          input: `
-次のテキストが料理名または食材名かどうかを判定してください。
-料理・食材なら YES、それ以外は NO のみで答えてください。
+    /* === 1日の合計 === */
+    if (userText === "1日の合計") {
+      try {
+        const sumRes = await fetch(
+          `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${userId}&eaten_at=eq.${today}`,
+          {
+            headers: {
+              apikey: process.env.SUPABASE_ANON_KEY,
+              Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+            },
+          }
+        );
 
-テキスト: ${userText}
-          `,
-        }),
-      });
+        const rows = await sumRes.json();
+        if (!rows.length) {
+          await reply(replyToken, "今日はまだ食事ログがありません 🍽");
+          return res.status(200).end();
+        }
 
-      const judgeData = await judgeRes.json();
-      const judge = extractText(judgeData)?.trim();
-
-      if (judge === "YES") {
-        const aiRes = await fetch("https://api.openai.com/v1/responses", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: "gpt-4.1-mini",
-            input: `
-以下の料理・食材について、必ず次の形式で出力してください。
-Markdown記法は使わないでください。
-
-🍽 推定結果（目安）
-
-🔥 合計
-カロリー：約 xxx kcal
-PFC
-・たんぱく質：xx g
-・脂質：xx g
-・炭水化物：xx g
-
-――――――――――
-① 料理名
-カロリー：約 xxx kcal
-PFC
-・たんぱく質：xx g
-・脂質：xx g
-・炭水化物：xx g
-
-② 料理名
-カロリー：約 xxx kcal
-PFC
-・たんぱく質：xx g
-・脂質：xx g
-・炭水化物：xx g
-
-（料理があるだけ続ける）
-
-✅ ポイント
-栄養バランスや食べ方について一言コメントしてください。
-
-料理・食材名：
-${userText}
-            `,
-          }),
+        let kcal = 0, p = 0, f = 0, c = 0;
+        rows.forEach(r => {
+          kcal += r.calories;
+          p += r.protein;
+          f += r.fat;
+          c += r.carbs;
         });
 
-        const aiData = await aiRes.json();
-        const text = extractText(aiData) || "解析できませんでした";
-
-        await reply(replyToken, text);
-      } else {
         await reply(
           replyToken,
-          "料理や食材をテキストか写真で送ると目安カロリーとPFCを知ることができます 📸🍽"
+          `🍽 1日の合計（目安）
+
+🔥 カロリー
+約 ${Math.round(kcal)} kcal
+
+🥗 PFC
+・たんぱく質：${p.toFixed(1)} g
+・脂質：${f.toFixed(1)} g
+・炭水化物：${c.toFixed(1)} g`
         );
+      } catch (e) {
+        console.error(e);
+        await reply(replyToken, "❌ 集計に失敗しました");
       }
+
+      return res.status(200).end();
+    }
+
+    /* === 料理/食材 判定 === */
+    try {
+      const judgeRes = await openai(`${userText} は料理名または食材名ですか？YESかNOで答えて`);
+      if (judgeRes !== "YES") {
+        await reply(
+          replyToken,
+          "料理や食材をテキストか写真で送ると目安カロリーを知ることができます 📸🍽"
+        );
+        return res.status(200).end();
+      }
+
+      const result = await openai(
+        `${userText} のカロリーとPFCを数値で推定してください`
+      );
+
+      await reply(replyToken, `🍽 推定結果（目安）\n\n${result}`);
+
+      await saveLog(userId, userText, result, today);
     } catch (e) {
       console.error(e);
       await reply(replyToken, "❌ エラーが発生しました");
@@ -98,105 +85,53 @@ ${userText}
     return res.status(200).end();
   }
 
-  /* ===== 画像 ===== */
-  if (event.message.type === "image") {
-    await reply(replyToken, "📸 解析中です…少しお待ちください");
-
-    try {
-      const imgRes = await fetch(
-        `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-          },
-        }
-      );
-      const buffer = Buffer.from(await imgRes.arrayBuffer());
-
-      const form = new FormData();
-      form.append("file", new Blob([buffer]));
-      form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
-
-      const cloudRes = await fetch(
-        `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
-        { method: "POST", body: form }
-      );
-
-      const cloudData = await cloudRes.json();
-      const imageUrl = cloudData.secure_url;
-
-      const aiRes = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4.1-mini",
-          input: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "input_text",
-                  text: `
-写真に写っている料理・食材をすべて特定してください。
-1品とは限らない前提で解析してください。
-
-必ず次の形式で出力してください。
-Markdown記法は禁止です。
-
-🍽 推定結果（目安）
-
-🔥 合計
-カロリー：約 xxx kcal
-PFC
-・たんぱく質：xx g
-・脂質：xx g
-・炭水化物：xx g
-
-――――――――――
-① 料理名
-カロリー：約 xxx kcal
-PFC
-・たんぱく質：xx g
-・脂質：xx g
-・炭水化物：xx g
-
-② 料理名
-カロリー：約 xxx kcal
-PFC
-・たんぱく質：xx g
-・脂質：xx g
-・炭水化物：xx g
-
-（料理があるだけ続ける）
-
-✅ ポイント
-全体の栄養バランスについて一言コメント
-                  `,
-                },
-                { type: "input_image", image_url: imageUrl },
-              ],
-            },
-          ],
-        }),
-      });
-
-      const aiData = await aiRes.json();
-      const text = extractText(aiData) || "解析できませんでした";
-
-      await push(userId, text);
-    } catch (e) {
-      console.error(e);
-      await push(userId, "❌ 解析に失敗しました");
-    }
-  }
-
   res.status(200).end();
 }
 
-/* ===== reply ===== */
+/* ===== OpenAI ===== */
+async function openai(prompt) {
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      input: prompt,
+    }),
+  });
+
+  const j = await r.json();
+  return extractText(j)?.trim() || "";
+}
+
+/* ===== Supabase 保存 ===== */
+async function saveLog(userId, name, text, date) {
+  const nums = text.match(/([\d.]+)/g) || [];
+  const body = {
+    user_id: userId,
+    food_name: name,
+    calories: Number(nums[0] || 0),
+    protein: Number(nums[1] || 0),
+    fat: Number(nums[2] || 0),
+    carbs: Number(nums[3] || 0),
+    eaten_at: date,
+  };
+
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/food_logs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: process.env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+/* ===== LINE reply ===== */
 async function reply(token, text) {
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -211,29 +146,12 @@ async function reply(token, text) {
   });
 }
 
-/* ===== push ===== */
-async function push(userId, text) {
-  await fetch("https://api.line.me/v2/bot/message/push", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-    },
-    body: JSON.stringify({
-      to: userId,
-      messages: [{ type: "text", text }],
-    }),
-  });
-}
-
 /* ===== OpenAI text抽出 ===== */
 function extractText(aiData) {
   try {
     for (const item of aiData.output || []) {
       for (const c of item.content || []) {
-        if (c.type === "output_text" && c.text) {
-          return c.text;
-        }
+        if (c.type === "output_text") return c.text;
       }
     }
   } catch {}
