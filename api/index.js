@@ -1,133 +1,171 @@
-import fetch from "node-fetch";
-import { v2 as cloudinary } from "cloudinary";
-
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(200).send("OK");
-  }
+  if (req.method !== "POST") return res.status(405).end();
 
-  const event = req.body.events?.[0];
-  if (!event) return res.status(200).send("No event");
+  const event = req.body?.events?.[0];
+  if (!event) return res.status(200).end();
 
   const replyToken = event.replyToken;
-  const message = event.message;
+  const userId = event.source?.userId;
 
-  const reply = async (text) => {
-    await fetch("https://api.line.me/v2/bot/message/reply", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-      },
-      body: JSON.stringify({
-        replyToken,
-        messages: [{ type: "text", text }],
-      }),
-    });
-  };
+  /* ===== テキスト ===== */
+  if (event.message.type === "text") {
+    const userText = event.message.text;
 
-  // --- テキストメッセージ ---
-  if (message.type === "text") {
-    const userText = message.text;
-
-    const aiRes = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4.1-mini",
-        input: [
-          {
-            role: "user",
-            content: `
-以下のテキストが「食材・料理名」の場合は、
-1. 料理名
-2. 推定カロリー（kcal）
-3. PFC（たんぱく質g・脂質g・炭水化物g）
-
-を日本語で分かりやすく出力してください。
-
-食材や料理と関係ない内容の場合は、
-「料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます」
-とだけ返してください。
-
-テキスト：
-「${userText}」
-`,
-          },
-        ],
-      }),
-    });
-
-    const data = await aiRes.json();
-    const text =
-      data.output?.[0]?.content?.[0]?.text ||
-      "解析できませんでした";
-
-    await reply(text);
-    return res.status(200).end();
-  }
-
-  // --- 画像メッセージ ---
-  if (message.type === "image") {
-    await reply("📸 解析中です…少しお待ちください");
-
-    // 画像取得
-    const imageRes = await fetch(
-      `https://api-data.line.me/v2/bot/message/${message.id}/content`,
-      {
+    try {
+      const aiRes = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
         headers: {
-          Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         },
-      }
-    );
+        body: JSON.stringify({
+          model: "gpt-4.1-mini",
+          input: `
+次のテキストが「料理名または食材名」かどうかを判定してください。
 
-    const buffer = await imageRes.buffer();
+・料理/食材なら → YES
+・それ以外なら → NO
 
-    // Cloudinaryへアップロード
-    const uploadRes = await new Promise((resolve, reject) => {
-      cloudinary.uploader.upload_stream(
-        {
-          upload_preset: process.env.CLOUDINARY_UPLOAD_PRESET,
-        },
-        (error, result) => {
-          if (error) reject(error);
-          else resolve(result);
-        }
-      ).end(buffer);
-    });
+テキスト: ${userText}
+          `,
+        }),
+      });
 
-    // AI解析
-    const aiRes = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4.1-mini",
-        input: [
-          {
-            role: "user",
-            content: [
-              { type: "input_text", text: "この料理のカロリーとPFC（たんぱく質・脂質・炭水化物）を推定して、日本語で分かりやすく出力してください。" },
-              { type: "input_image", image_url: uploadRes.secure_url },
-            ],
+      const aiData = await aiRes.json();
+      const judge = extractText(aiData)?.trim();
+
+      if (judge === "YES") {
+        // カロリー推定
+        const kcalRes = await fetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
           },
-        ],
-      }),
-    });
+          body: JSON.stringify({
+            model: "gpt-4.1-mini",
+            input: `${userText} の目安カロリーとPFC（たんぱく質g・脂質g・炭水化物g）を日本語で分かりやすく教えてください`,
+          }),
+        });
 
-    const data = await aiRes.json();
-    const text =
-      data.output?.[0]?.content?.[0]?.text ||
-      "解析できませんでした";
+        const kcalData = await kcalRes.json();
+        const kcalText = extractText(kcalData) || "推定できませんでした";
 
-    await reply(text);
+        await reply(replyToken, `🍽 推定結果\n${kcalText}`);
+      } else {
+        await reply(
+          replyToken,
+          "料理や食材をテキストか写真で送ると目安カロリーを知ることができます 📸🍽"
+        );
+      }
+    } catch (e) {
+      console.error(e);
+      await reply(replyToken, "❌ エラーが発生しました");
+    }
+
     return res.status(200).end();
   }
 
-  return res.status(200).end();
+  /* ===== 画像（今まで通り） ===== */
+  if (event.message.type === "image") {
+    await reply(replyToken, "📸 解析中です…少しお待ちください");
+
+    try {
+      const imgRes = await fetch(
+        `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+          },
+        }
+      );
+      const buffer = Buffer.from(await imgRes.arrayBuffer());
+
+      const form = new FormData();
+      form.append("file", new Blob([buffer]));
+      form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
+
+      const cloudRes = await fetch(
+        `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
+        { method: "POST", body: form }
+      );
+
+      const cloudData = await cloudRes.json();
+      const imageUrl = cloudData.secure_url;
+
+      const aiRes = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4.1-mini",
+          input: [
+            {
+              role: "user",
+              content: [
+                { type: "input_text", text: "料理名と目安カロリーとPFC（たんぱく質g・脂質g・炭水化物g）を日本語で分かりやすく教えてください" },
+                { type: "input_image", image_url: imageUrl },
+              ],
+            },
+          ],
+        }),
+      });
+
+      const aiData = await aiRes.json();
+      const text = extractText(aiData) || "解析できませんでした";
+
+      await push(userId, `🍽 推定結果\n${text}`);
+    } catch (e) {
+      console.error(e);
+      await push(userId, "❌ 解析に失敗しました");
+    }
+  }
+
+  res.status(200).end();
+}
+
+/* ===== reply ===== */
+async function reply(token, text) {
+  await fetch("https://api.line.me/v2/bot/message/reply", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({
+      replyToken: token,
+      messages: [{ type: "text", text }],
+    }),
+  });
+}
+
+/* ===== push ===== */
+async function push(userId, text) {
+  await fetch("https://api.line.me/v2/bot/message/push", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({
+      to: userId,
+      messages: [{ type: "text", text }],
+    }),
+  });
+}
+
+/* ===== OpenAI text抽出 ===== */
+function extractText(aiData) {
+  try {
+    for (const item of aiData.output || []) {
+      for (const c of item.content || []) {
+        if (c.type === "output_text" && c.text) {
+          return c.text;
+        }
+      }
+    }
+  } catch {}
+  return null;
 }
