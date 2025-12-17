@@ -1,11 +1,4 @@
-import { v2 as cloudinary } from "cloudinary";
 import OpenAI from "openai";
-
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -30,7 +23,7 @@ export default async function handler(req, res) {
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
     try {
-      // 1️⃣ LINE画像取得（fetchは標準）
+      // 1️⃣ LINE画像取得
       const imgRes = await fetch(
         `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
         {
@@ -42,16 +35,24 @@ export default async function handler(req, res) {
 
       const buffer = Buffer.from(await imgRes.arrayBuffer());
 
-      // 2️⃣ Cloudinaryへアップロード
-      const uploadResult = await new Promise((resolve, reject) => {
-        cloudinary.uploader.upload_stream(
-          { upload_preset: process.env.CLOUDINARY_UPLOAD_PRESET },
-          (err, result) => {
-            if (err) reject(err);
-            else resolve(result);
-          }
-        ).end(buffer);
-      });
+      // 2️⃣ Cloudinary（Unsigned upload / SDK不使用）
+      const form = new FormData();
+      form.append("file", new Blob([buffer]));
+      form.append(
+        "upload_preset",
+        process.env.CLOUDINARY_UPLOAD_PRESET
+      );
+
+      const cloudinaryRes = await fetch(
+        `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
+        {
+          method: "POST",
+          body: form,
+        }
+      );
+
+      const cloudinaryData = await cloudinaryRes.json();
+      const imageUrl = cloudinaryData.secure_url;
 
       // 3️⃣ OpenAI Vision
       const ai = await openai.responses.create({
@@ -60,17 +61,24 @@ export default async function handler(req, res) {
           {
             role: "user",
             content: [
-              { type: "input_text", text: "料理名とカロリーを推定してください" },
-              { type: "input_image", image_url: uploadResult.secure_url },
+              {
+                type: "input_text",
+                text: "料理名とカロリーを推定してください",
+              },
+              {
+                type: "input_image",
+                image_url: imageUrl,
+              },
             ],
           },
         ],
       });
 
-      const text =
-        ai.output_text || "🍽 推定結果\n解析できませんでした";
+      const result =
+        ai.output_text ||
+        "🍽 推定結果\n解析できませんでした";
 
-      await reply(replyToken, `🍽 推定結果\n${text}`);
+      await reply(replyToken, `🍽 推定結果\n${result}`);
     } catch (e) {
       console.error(e);
       await reply(replyToken, "❌ 解析に失敗しました");
