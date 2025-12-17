@@ -5,6 +5,7 @@ export default async function handler(req, res) {
   if (!event) return res.status(200).end();
 
   const replyToken = event.replyToken;
+  const userId = event.source?.userId;
 
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
@@ -14,6 +15,7 @@ export default async function handler(req, res) {
 
   /* ===== 画像 ===== */
   if (event.message.type === "image") {
+    // ① 先に reply（1回だけ）
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
     try {
@@ -26,26 +28,22 @@ export default async function handler(req, res) {
           },
         }
       );
-
       const buffer = Buffer.from(await imgRes.arrayBuffer());
 
-      /* 2️⃣ Cloudinary（Unsigned Upload） */
+      /* 2️⃣ Cloudinary */
       const form = new FormData();
       form.append("file", new Blob([buffer]));
       form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
 
       const cloudRes = await fetch(
         `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
-        {
-          method: "POST",
-          body: form,
-        }
+        { method: "POST", body: form }
       );
 
       const cloudData = await cloudRes.json();
       const imageUrl = cloudData.secure_url;
 
-      /* 3️⃣ OpenAI Vision（REST直叩き） */
+      /* 3️⃣ OpenAI */
       const aiRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -58,15 +56,8 @@ export default async function handler(req, res) {
             {
               role: "user",
               content: [
-                {
-                  type: "input_text",
-                  text:
-                    "この料理の名前とカロリーを推定してください。日本語で簡潔に。",
-                },
-                {
-                  type: "input_image",
-                  image_url: imageUrl,
-                },
+                { type: "input_text", text: "料理名とカロリーを推定してください" },
+                { type: "input_image", image_url: imageUrl },
               ],
             },
           ],
@@ -74,22 +65,20 @@ export default async function handler(req, res) {
       });
 
       const aiData = await aiRes.json();
-      const text = extractText(aiData);
+      const text = extractText(aiData) || "解析できませんでした";
 
-      await reply(
-        replyToken,
-        `🍽 推定結果\n${text || "解析できませんでした"}`
-      );
+      // ② 結果は push で送る（replyTokenは使わない）
+      await push(userId, `🍽 推定結果\n${text}`);
     } catch (e) {
       console.error(e);
-      await reply(replyToken, "❌ 解析に失敗しました");
+      await push(userId, "❌ 解析に失敗しました");
     }
   }
 
   res.status(200).end();
 }
 
-/* ===== LINE返信 ===== */
+/* ===== reply（1回だけ） ===== */
 async function reply(token, text) {
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -104,7 +93,22 @@ async function reply(token, text) {
   });
 }
 
-/* ===== OpenAI text 抽出（超重要） ===== */
+/* ===== push（何回でもOK） ===== */
+async function push(userId, text) {
+  await fetch("https://api.line.me/v2/bot/message/push", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({
+      to: userId,
+      messages: [{ type: "text", text }],
+    }),
+  });
+}
+
+/* ===== OpenAI text抽出 ===== */
 function extractText(aiData) {
   try {
     for (const item of aiData.output || []) {
@@ -114,6 +118,6 @@ function extractText(aiData) {
         }
       }
     }
-  } catch (e) {}
+  } catch {}
   return null;
 }
