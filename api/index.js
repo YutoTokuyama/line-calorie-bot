@@ -12,7 +12,6 @@ export default async function handler(req, res) {
     const userText = event.message.text;
 
     try {
-      // 判定
       const judgeRes = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -23,7 +22,7 @@ export default async function handler(req, res) {
           model: "gpt-4.1-mini",
           input: `
 次のテキストが料理名または食材名かどうかを判定してください。
-料理・食材なら YES、それ以外は NO だけで答えてください。
+料理・食材なら YES、それ以外は NO のみで答えてください。
 
 テキスト: ${userText}
           `,
@@ -43,25 +42,37 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             model: "gpt-4.1-mini",
             input: `
-以下の料理または食材について、必ず次の形式で出力してください。
-記号や装飾は使ってOKですが、Markdown記法（#, **, | など）は使わないでください。
-
-【出力形式】
+以下の料理・食材について、必ず次の形式で出力してください。
+Markdown記法は使わないでください。
 
 🍽 推定結果（目安）
 
-料理：◯◯◯
-
-🔥 カロリー
-約 xxx kcal
-
-🥗 PFCバランス
+🔥 合計
+カロリー：約 xxx kcal
+PFC
 ・たんぱく質：xx g
 ・脂質：xx g
 ・炭水化物：xx g
 
+――――――――――
+① 料理名
+カロリー：約 xxx kcal
+PFC
+・たんぱく質：xx g
+・脂質：xx g
+・炭水化物：xx g
+
+② 料理名
+カロリー：約 xxx kcal
+PFC
+・たんぱく質：xx g
+・脂質：xx g
+・炭水化物：xx g
+
+（料理があるだけ続ける）
+
 ✅ ポイント
-栄養面や食べ方について一言コメントしてください。
+栄養バランスや食べ方について一言コメントしてください。
 
 料理・食材名：
 ${userText}
@@ -129,23 +140,40 @@ ${userText}
                 {
                   type: "input_text",
                   text: `
-この料理の内容を分析し、以下の形式で出力してください。
-Markdownは使わないでください。
+写真に写っている料理・食材をすべて特定してください。
+1品とは限らない前提で解析してください。
+
+必ず次の形式で出力してください。
+Markdown記法は禁止です。
 
 🍽 推定結果（目安）
 
-料理：
-
-🔥 カロリー
-約 xxx kcal
-
-🥗 PFCバランス
+🔥 合計
+カロリー：約 xxx kcal
+PFC
 ・たんぱく質：xx g
 ・脂質：xx g
 ・炭水化物：xx g
 
+――――――――――
+① 料理名
+カロリー：約 xxx kcal
+PFC
+・たんぱく質：xx g
+・脂質：xx g
+・炭水化物：xx g
+
+② 料理名
+カロリー：約 xxx kcal
+PFC
+・たんぱく質：xx g
+・脂質：xx g
+・炭水化物：xx g
+
+（料理があるだけ続ける）
+
 ✅ ポイント
-栄養面について一言コメント
+全体の栄養バランスについて一言コメント
                   `,
                 },
                 { type: "input_image", image_url: imageUrl },
