@@ -5,7 +5,9 @@ export default async function handler(req, res) {
 
   const replyToken = event.replyToken;
   const userId = event.source?.userId;
-  const today = new Date().toISOString().slice(0, 10);
+
+  // ★JSTで「今日」を作る（重要）
+  const today = getJstDate(); // YYYY-MM-DD (Asia/Tokyo)
 
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
@@ -73,7 +75,7 @@ export default async function handler(req, res) {
       );
 
       await reply(replyToken, result ? `🍽 推定結果（目安）\n\n${result}` : "解析できませんでした");
-      await saveFromText(userId, text, result || "", today);
+      await saveFromText(userId, sanitizeFoodName(text), result || "", today);
     } catch (e) {
       console.error(e);
       await reply(replyToken, "❌ エラーが発生しました");
@@ -84,7 +86,6 @@ export default async function handler(req, res) {
 
   /* ===== 画像 ===== */
   if (event.message.type === "image") {
-    // replyTokenは1回だけ使う（解析中）
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
     try {
@@ -105,7 +106,6 @@ export default async function handler(req, res) {
       const upJson = await up.json();
       const imageUrl = upJson.secure_url;
 
-      // ★ここが重要：JSON固定で返させる
       const ai = await openaiJson([
         {
           role: "user",
@@ -129,7 +129,7 @@ export default async function handler(req, res) {
 - itemsには合計を入れない（"合計"や"総計"はitemsに含めない）
 - itemsは画像内に写っている料理/食材の数だけ入れる
 - totalはitemsの合計と整合する値にする
-- 推定でOK。数値は現実的な範囲にする
+- 推定でOK
               `.trim(),
             },
             { type: "input_image", image_url: imageUrl },
@@ -140,12 +140,13 @@ export default async function handler(req, res) {
       const parsed = parseMultiFood(ai);
       const message = formatImageResult(parsed);
 
-      // 結果は push で送る
       if (userId) await push(userId, message);
 
-      // itemsだけ保存（totalは保存しない）
+      // ★保存前に name を必ずサニタイズ
       for (const f of parsed.items) {
-        await saveLog(userId, f.name, f, today);
+        const cleanName = sanitizeFoodName(f.name);
+        if (!cleanName) continue;
+        await saveLog(userId, cleanName, f, today);
       }
     } catch (e) {
       console.error(e);
@@ -156,6 +157,45 @@ export default async function handler(req, res) {
   }
 
   res.status(200).end();
+}
+
+/* ===== JST日付（YYYY-MM-DD） ===== */
+function getJstDate() {
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const y = parts.find(p => p.type === "year")?.value;
+  const m = parts.find(p => p.type === "month")?.value;
+  const d = parts.find(p => p.type === "day")?.value;
+  return `${y}-${m}-${d}`;
+}
+
+/* ===== food_name サニタイズ ===== */
+function sanitizeFoodName(name) {
+  if (!name) return "";
+  let s = String(name);
+
+  // 改行以降は捨てる（混入防止）
+  s = s.split("\n")[0];
+
+  // 料理名以外のワードが入ってたらそこで切る
+  const cutWords = ["カロリー", "PFC", "たんぱく質", "脂質", "炭水化物", "推定結果", "合計", "総計"];
+  for (const w of cutWords) {
+    const idx = s.indexOf(w);
+    if (idx > 0) s = s.slice(0, idx);
+  }
+
+  // 先頭の番号や記号を除去
+  s = s.replace(/^[\s]*[①-⑨0-9]+[)\]）\.．:\s-]*/g, "");
+  s = s.replace(/^[\s]*[・\-–—]+/g, "");
+  s = s.trim();
+
+  // 長すぎる/空は弾く
+  if (!s || s.length > 50) return s.slice(0, 50).trim();
+  return s;
 }
 
 /* ===== OpenAI ===== */
@@ -219,23 +259,34 @@ async function saveFromText(userId, name, text, date) {
 }
 
 /* ===== utils ===== */
-function extractText(ai) {
-  for (const o of ai.output || []) {
-    for (const c of o.content || []) {
-      if (c.type === "output_text") return c.text;
+function extractText(aiData) {
+  try {
+    for (const item of aiData.output || []) {
+      for (const c of item.content || []) {
+        if (c.type === "output_text" && c.text) return c.text;
+      }
     }
-  }
+  } catch {}
   return null;
 }
 
-// ★JSON固定を優先。失敗したら最低限のフォールバック
+function tryParseJson(text) {
+  try {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start) return null;
+    return JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
 function parseMultiFood(ai) {
   const raw = extractText(ai) || "";
-  const parsedJson = tryParseJson(raw);
+  const j = tryParseJson(raw);
 
-  if (parsedJson && parsedJson.items && parsedJson.total) {
-    // itemsに合計が混ざらないよう二重ガード
-    const items = (parsedJson.items || [])
+  if (j && j.items && j.total) {
+    const items = (j.items || [])
       .filter(x => x && x.name && !/合計|総計/i.test(String(x.name)))
       .map(x => ({
         name: String(x.name),
@@ -246,50 +297,26 @@ function parseMultiFood(ai) {
       }));
 
     const total = {
-      kcal: Number(parsedJson.total.kcal || 0),
-      p: Number(parsedJson.total.p || 0),
-      f: Number(parsedJson.total.f || 0),
-      c: Number(parsedJson.total.c || 0),
+      kcal: Number(j.total.kcal || 0),
+      p: Number(j.total.p || 0),
+      f: Number(j.total.f || 0),
+      c: Number(j.total.c || 0),
     };
 
-    // totalが空っぽ/不整合なら items から再計算
     const calc = items.reduce(
       (a, x) => (a.kcal += x.kcal, a.p += x.p, a.f += x.f, a.c += x.c, a),
       { kcal: 0, p: 0, f: 0, c: 0 }
     );
-    const fixedTotal =
-      total.kcal > 0 ? total : calc;
+    const fixedTotal = total.kcal > 0 ? total : calc;
 
-    return {
-      total: fixedTotal,
-      items,
-      point: String(parsedJson.point || ""),
-      raw,
-    };
+    return { total: fixedTotal, items, point: String(j.point || ""), raw };
   }
 
-  // フォールバック：返答そのまま（「返ってこない」を防ぐ）
   return { total: { kcal: 0, p: 0, f: 0, c: 0 }, items: [], point: "", raw };
 }
 
-function tryParseJson(text) {
-  try {
-    // 返答のどこかにJSONがあっても拾う
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start) return null;
-    const jsonStr = text.slice(start, end + 1);
-    return JSON.parse(jsonStr);
-  } catch {
-    return null;
-  }
-}
-
 function formatImageResult(d) {
-  // JSONパース失敗時は raw をそのまま返す
-  if (!d.items.length) {
-    return d.raw ? `🍽 推定結果（目安）\n\n${d.raw}` : "解析できませんでした";
-  }
+  if (!d.items.length) return d.raw ? `🍽 推定結果（目安）\n\n${d.raw}` : "解析できませんでした";
 
   let s =
 `🍽 推定結果（目安）
@@ -307,7 +334,7 @@ PFC
   d.items.forEach((x, i) => {
     s += `
 
-${i + 1}) ${x.name}
+${i + 1}) ${sanitizeFoodName(x.name)}
 カロリー：約 ${Math.round(x.kcal)} kcal
 PFC
 ・たんぱく質：${Number(x.p).toFixed(1)} g
@@ -315,17 +342,10 @@ PFC
 ・炭水化物：${Number(x.c).toFixed(1)} g`;
   });
 
-  if (d.point) {
-    s += `
+  s += `
 
 ✅ ポイント
-${d.point}`;
-  } else {
-    s += `
-
-✅ ポイント
-量や具材で数値は変動します。必要なら「ご飯150g」「唐揚げ3個」など量も送ると精度が上がります。`;
-  }
+${d.point || "量や具材で数値は変動します。必要なら量も送ると精度が上がります。"}`;
 
   return s;
 }
@@ -338,10 +358,7 @@ async function reply(token, text) {
       "Content-Type": "application/json",
       Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({
-      replyToken: token,
-      messages: [{ type: "text", text }],
-    }),
+    body: JSON.stringify({ replyToken: token, messages: [{ type: "text", text }] }),
   });
   if (!r.ok) console.log("LINE reply failed:", r.status, await r.text());
 }
@@ -353,10 +370,7 @@ async function push(userId, text) {
       "Content-Type": "application/json",
       Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({
-      to: userId,
-      messages: [{ type: "text", text }],
-    }),
+    body: JSON.stringify({ to: userId, messages: [{ type: "text", text }] }),
   });
   if (!r.ok) console.log("LINE push failed:", r.status, await r.text());
 }
