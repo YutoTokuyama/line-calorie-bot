@@ -26,7 +26,7 @@ async function handleEvent(event) {
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
     const text = event.message.text.trim();
-    const lineMessageId = event.message.id; // ← 二重計上防止キー
+    const lineMessageId = event.message.id; // 二重送信判定キー
 
     // 日付指定合計
     const sumDate = parseSumDate(text);
@@ -55,6 +55,12 @@ async function handleEvent(event) {
       return;
     }
 
+    // webhook再送など同一メッセージの場合は計算しない（コスト節約＆0kcal防止）
+    if (await existsLogForMessage(userId, lineMessageId)) {
+      await push(userId, "🔁 同じメッセージが送られたので計算しませんでした。");
+      return;
+    }
+
     // 解析中
     await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
 
@@ -79,8 +85,15 @@ async function handleEvent(event) {
 
   /* ===== 画像 ===== */
   if (event.message.type === "image") {
+    const lineMessageId = event.message.id; // 二重送信判定キー
+
+    // webhook再送など同一メッセージの場合は計算しない（OpenAI/Cloudinaryをスキップ）
+    if (await existsLogForMessage(userId, lineMessageId)) {
+      await push(userId, "🔁 同じ画像が送られたので計算しませんでした。");
+      return;
+    }
+
     await reply(replyToken, "📸 解析中です…少しお待ちください");
-    const lineMessageId = event.message.id; // ← 二重計上防止キー
 
     const imgRes = await fetch(
       `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
@@ -174,9 +187,9 @@ async function openaiJson(input) {
 
 /* ===============================
    Supabase
-   - 二重計上防止： (user_id, line_message_id, item_index) をユニークにし upsert
 ================================ */
 async function saveLog(userId, name, f, date, lineMessageId, itemIndex) {
+  // 二重計上防止: (user_id, line_message_id, item_index) でupsert
   const url =
     `${process.env.SUPABASE_URL}/rest/v1/food_logs` +
     `?on_conflict=user_id,line_message_id,item_index`;
@@ -214,6 +227,25 @@ async function fetchFoodLogs(userId, date) {
     },
   });
   return await r.json();
+}
+
+// すでに同一 message_id のログがあるなら webhook再送とみなしてスキップ
+async function existsLogForMessage(userId, lineMessageId) {
+  if (!userId || !lineMessageId) return false;
+
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?select=id&user_id=eq.${encodeURIComponent(
+    userId
+  )}&line_message_id=eq.${encodeURIComponent(lineMessageId)}&limit=1`;
+
+  const r = await fetch(url, {
+    headers: {
+      apikey: process.env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+    },
+  });
+
+  const j = await r.json().catch(() => []);
+  return Array.isArray(j) && j.length > 0;
 }
 
 /* ===============================
@@ -284,7 +316,7 @@ function parseSingleFood(ai, fallback) {
   return { item, total: item, point: j?.point || "" };
 }
 
-/* ✅ NaN修正：?? の優先順位問題を避けて確実に足す */
+// ✅ NaN修正：?? の優先順位問題を避けて確実に足す
 function sumRows(rows) {
   return rows.reduce(
     (a, x) => {
