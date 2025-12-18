@@ -57,7 +57,7 @@ async function handleEvent(event) {
       return;
     }
 
-    // ✅ 同じテキストでも毎回結果が返るようにする（重複判定で弾かない）
+    // ✅ 同じテキストでも毎回結果が返る（重複判定で弾かない）
     await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
 
     // 料理判定
@@ -72,9 +72,16 @@ async function handleEvent(event) {
 
     const ai = await openaiJsonTextFood(text);
     const parsed = parseSingleFood(ai, text);
+
+    // 0kcalっぽい失敗時は保存しない
+    if (!parsed.item || !isFiniteNumber(parsed.item.kcal) || parsed.item.kcal <= 0) {
+      console.error("text parse failed:", extractText(ai));
+      await push(userId, "⚠️ 解析に失敗しました。少し表現を変えてもう一度送ってください。");
+      return;
+    }
+
     await push(userId, formatTextResult(parsed));
 
-    // テキストは毎回保存（同じ料理を複数回食べた、にも対応）
     await saveLog(
       userId,
       sanitizeFoodName(parsed.item.name),
@@ -91,20 +98,18 @@ async function handleEvent(event) {
   if (event.message.type === "image") {
     const lineMessageId = event.message.id;
 
-    // webhook再送（同じ message.id）が来たら無言で終了（通知スパム防止）
+    // webhook再送（同一 message.id）は即return（通知スパム防止）
     if (await existsLogForMessage(userId, lineMessageId)) return;
 
-    // まず画像バイナリを取得（ここでhashを作る）
+    // 画像取得 → hash作成（手動で同じ画像でも検知できる）
     const imgRes = await fetch(
       `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
       { headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` } }
     );
     const buf = Buffer.from(await imgRes.arrayBuffer());
-
-    // ✅ 手動で同じ画像を再送しても検知できるように sha256 を取る
     const imageHash = crypto.createHash("sha256").update(buf).digest("hex");
 
-    // 今日すでに同じ画像が登録されていたら、計算しない（OpenAI/Cloudinaryスキップ）
+    // ✅ 同日内で同じ画像がすでに登録されていたら計算しない
     if (await existsImageHashForDate(userId, today, imageHash)) {
       await push(userId, "🔁 同じ画像が送られたため、今回は計算しませんでした。");
       return;
@@ -112,7 +117,7 @@ async function handleEvent(event) {
 
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
-    // Cloudinaryへアップロード（重複じゃない時だけ）
+    // Cloudinaryへアップ（重複じゃない時だけ）
     const form = new FormData();
     form.append("file", new Blob([buf]));
     form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
@@ -127,9 +132,18 @@ async function handleEvent(event) {
     const ai = await openaiJsonImage(imageUrl);
     const parsed = parseMultiFood(ai);
 
+    // ✅ 0kcal（=パース失敗）なら結果を返さない＆保存しない
+    if (!parsed.items.length || !isFiniteNumber(parsed.total.kcal) || parsed.total.kcal <= 0) {
+      console.error("image parse failed output_text:", extractText(ai));
+      await push(
+        userId,
+        "⚠️ 画像の解析に失敗しました。料理がはっきり写るように撮り直して、もう一度送ってください。"
+      );
+      return;
+    }
+
     await push(userId, formatImageResult(parsed));
 
-    // 画像は複数料理になるので index を振る
     for (let i = 0; i < parsed.items.length; i++) {
       const f = parsed.items[i];
       await saveLog(
@@ -182,11 +196,29 @@ ${text}
 }
 
 async function openaiJsonImage(imageUrl) {
+  // ✅ 画像もテキスト同様に「厳格JSONスキーマ」を要求
+  const prompt = `
+出力はJSONのみ。前後に説明文は禁止。
+
+{
+ "total": { "kcal": number, "p": number, "f": number, "c": number },
+ "items": [{ "name": string, "kcal": number, "p": number, "f": number, "c": number }],
+ "point": string
+}
+
+ルール:
+- 写真に写っている料理を items に列挙（1〜6件程度）
+- 材料分解は禁止（料理単位）
+- 数値は必ず0より大きい現実的な推定値
+- totalはitems合計と一致
+- 分からない場合でも items を空にしない（最も近い料理名で推定する）
+`;
+
   return openaiJson([
     {
       role: "user",
       content: [
-        { type: "input_text", text: "料理とカロリー・PFCをJSONで推定してください" },
+        { type: "input_text", text: prompt },
         { type: "input_image", image_url: imageUrl },
       ],
     },
@@ -200,16 +232,27 @@ async function openaiJson(input) {
       "Content-Type": "application/json",
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
-    body: JSON.stringify({ model: "gpt-4.1-mini", input }),
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      input,
+      temperature: 0.2,
+      // ✅ JSONモード（壊れた出力を減らす）
+      text: { format: { type: "json_object" } },
+    }),
   });
-  return await r.json();
+
+  const j = await r.json();
+
+  // OpenAI側エラーが混ざると 0kcal になりがちなのでログに出す
+  if (!r.ok) console.error("openaiJson error:", j);
+
+  return j;
 }
 
 /* ===============================
    Supabase
 ================================ */
 async function saveLog(userId, name, f, date, lineMessageId, itemIndex, imageHash) {
-  // 二重計上防止: (user_id, line_message_id, item_index) でupsert
   const url =
     `${process.env.SUPABASE_URL}/rest/v1/food_logs` +
     `?on_conflict=user_id,line_message_id,item_index`;
@@ -250,7 +293,6 @@ async function fetchFoodLogs(userId, date) {
   return await r.json();
 }
 
-// webhook再送（同一 message.id）対策：すでに同一message_idのログがあれば true
 async function existsLogForMessage(userId, lineMessageId) {
   if (!userId || !lineMessageId) return false;
 
@@ -269,7 +311,6 @@ async function existsLogForMessage(userId, lineMessageId) {
   return Array.isArray(j) && j.length > 0;
 }
 
-// 手動で同じ画像を再送したケース対策：同日内に同じ image_hash があるか
 async function existsImageHashForDate(userId, date, imageHash) {
   if (!userId || !date || !imageHash) return false;
 
@@ -356,7 +397,10 @@ function parseSingleFood(ai, fallback) {
   return { item, total: item, point: j?.point || "" };
 }
 
-// ✅ NaN修正：?? の優先順位問題を避けて確実に足す
+function isFiniteNumber(n) {
+  return typeof n === "number" && Number.isFinite(n);
+}
+
 function sumRows(rows) {
   return rows.reduce(
     (a, x) => {
