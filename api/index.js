@@ -28,7 +28,7 @@ async function handleEvent(event) {
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
     const text = event.message.text.trim();
-    const lineMessageId = event.message.id; // 保存のidempotency用（結果返信は毎回する）
+    const lineMessageId = event.message.id;
 
     // 日付指定合計
     const sumDate = parseSumDate(text);
@@ -57,10 +57,9 @@ async function handleEvent(event) {
       return;
     }
 
-    // ✅ 同じテキストでも毎回結果が返る（重複判定で弾かない）
+    // ✅ 同じテキストでも毎回結果を返す
     await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
 
-    // 料理判定
     const judge = await openai(`${text} は料理名または食材名ですか？YESかNOのみで答えて`);
     if (judge !== "YES") {
       await push(
@@ -73,7 +72,6 @@ async function handleEvent(event) {
     const ai = await openaiJsonTextFood(text);
     const parsed = parseSingleFood(ai, text);
 
-    // 0kcalっぽい失敗時は保存しない
     if (!parsed.item || !isFiniteNumber(parsed.item.kcal) || parsed.item.kcal <= 0) {
       console.error("text parse failed:", extractText(ai));
       await push(userId, "⚠️ 解析に失敗しました。少し表現を変えてもう一度送ってください。");
@@ -89,7 +87,7 @@ async function handleEvent(event) {
       today,
       lineMessageId,
       1,
-      null // image_hashなし
+      null
     );
     return;
   }
@@ -101,7 +99,7 @@ async function handleEvent(event) {
     // webhook再送（同一 message.id）は即return（通知スパム防止）
     if (await existsLogForMessage(userId, lineMessageId)) return;
 
-    // 画像取得 → hash作成（手動で同じ画像でも検知できる）
+    // 画像取得 → hash作成（手動で同じ画像でも検知）
     const imgRes = await fetch(
       `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
       { headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` } }
@@ -109,7 +107,7 @@ async function handleEvent(event) {
     const buf = Buffer.from(await imgRes.arrayBuffer());
     const imageHash = crypto.createHash("sha256").update(buf).digest("hex");
 
-    // ✅ 同日内で同じ画像がすでに登録されていたら計算しない
+    // ✅ 同日内の同一画像は計算しない
     if (await existsImageHashForDate(userId, today, imageHash)) {
       await push(userId, "🔁 同じ画像が送られたため、今回は計算しませんでした。");
       return;
@@ -132,7 +130,7 @@ async function handleEvent(event) {
     const ai = await openaiJsonImage(imageUrl);
     const parsed = parseMultiFood(ai);
 
-    // ✅ 0kcal（=パース失敗）なら結果を返さない＆保存しない
+    // 失敗時は 0kcal を返さずエラー文にする
     if (!parsed.items.length || !isFiniteNumber(parsed.total.kcal) || parsed.total.kcal <= 0) {
       console.error("image parse failed output_text:", extractText(ai));
       await push(
@@ -196,7 +194,7 @@ ${text}
 }
 
 async function openaiJsonImage(imageUrl) {
-  // ✅ 画像もテキスト同様に「厳格JSONスキーマ」を要求
+  // ✅ 画像も「厳格JSONスキーマ」
   const prompt = `
 出力はJSONのみ。前後に説明文は禁止。
 
@@ -211,7 +209,6 @@ async function openaiJsonImage(imageUrl) {
 - 材料分解は禁止（料理単位）
 - 数値は必ず0より大きい現実的な推定値
 - totalはitems合計と一致
-- 分からない場合でも items を空にしない（最も近い料理名で推定する）
 `;
 
   return openaiJson([
@@ -242,10 +239,7 @@ async function openaiJson(input) {
   });
 
   const j = await r.json();
-
-  // OpenAI側エラーが混ざると 0kcal になりがちなのでログに出す
   if (!r.ok) console.error("openaiJson error:", j);
-
   return j;
 }
 
@@ -378,22 +372,38 @@ function tryParseJson(t) {
   }
 }
 
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function parseMultiFood(ai) {
   const j = tryParseJson(extractText(ai));
+
   const items = (j?.items || []).map(x => ({
     name: x.name,
-    kcal: +x.kcal,
-    p: +x.p,
-    f: +x.f,
-    c: +x.c,
+    kcal: num(x.kcal ?? x.calories),
+    // ✅ p/f/c でも protein/fat/carbs でも拾う
+    p: num(x.p ?? x.protein),
+    f: num(x.f ?? x.fat),
+    c: num(x.c ?? x.carbs),
   }));
+
+  // itemsが空になったら total も0になるので、ここで防げる
   const total = sumRows(items);
   return { items, total, point: j?.point || "" };
 }
 
 function parseSingleFood(ai, fallback) {
   const j = tryParseJson(extractText(ai));
-  const item = j?.items?.[0] || { name: fallback, kcal: 0, p: 0, f: 0, c: 0 };
+  const raw = j?.items?.[0] || { name: fallback, kcal: 0, p: 0, f: 0, c: 0 };
+  const item = {
+    name: raw.name ?? fallback,
+    kcal: num(raw.kcal ?? raw.calories),
+    p: num(raw.p ?? raw.protein),
+    f: num(raw.f ?? raw.fat),
+    c: num(raw.c ?? raw.carbs),
+  };
   return { item, total: item, point: j?.point || "" };
 }
 
@@ -447,16 +457,25 @@ ${d.point || "量や具材で数値は変動します。"}`;
 }
 
 function formatImageResult(d) {
+  // ✅ 画像でもPFCを表示する（合計＋各料理）
   let s = `🍽 推定結果（目安）
 
 🔥 合計
-約 ${Math.round(d.total.kcal)} kcal`;
+約 ${Math.round(d.total.kcal)} kcal
+
+🥗 合計PFC
+・たんぱく質：${d.total.p.toFixed(1)} g
+・脂質：${d.total.f.toFixed(1)} g
+・炭水化物：${d.total.c.toFixed(1)} g`;
+
   d.items.forEach((x, i) => {
     s += `
 
 ${i + 1}) ${x.name}
-約 ${Math.round(x.kcal)} kcal`;
+約 ${Math.round(x.kcal)} kcal
+P:${x.p.toFixed(1)}g F:${x.f.toFixed(1)}g C:${x.c.toFixed(1)}g`;
   });
+
   return s;
 }
 
