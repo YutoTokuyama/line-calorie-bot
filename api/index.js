@@ -4,13 +4,11 @@ export default async function handler(req, res) {
   const events = req.body?.events || [];
   if (!events.length) return res.status(200).end();
 
-  // ★複数イベントを全部処理
   for (const event of events) {
     try {
       await handleEvent(event);
     } catch (e) {
       console.error("handleEvent error:", e);
-      // 個別イベントの失敗で全体を落とさない
       continue;
     }
   }
@@ -29,7 +27,7 @@ async function handleEvent(event) {
   if (event.message.type === "text") {
     const text = event.message.text.trim();
 
-    // 1日の合計
+    /* --- 1日の合計（これは即時返信のままでOK） --- */
     if (text === "1日の合計") {
       try {
         const r = await fetch(
@@ -75,35 +73,40 @@ async function handleEvent(event) {
       return;
     }
 
-    // 料理/食材判定
+    /* --- ここから：テキストも「解析中」→ pushで結果 --- */
+    // replyTokenはこのイベントで1回だけ使う
+    await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
+
     try {
       const judge = await openai(`${text} は料理名または食材名ですか？YESかNOのみで答えて`);
       if (judge !== "YES") {
-        await reply(
-          replyToken,
-          "料理や食材をテキストか写真で送ると目安カロリーとPFCを知ることができます 📸🍽\n\n「1日の合計」と送ると今日の合計も確認できます。"
-        );
+        if (userId) {
+          await push(
+            userId,
+            "料理や食材をテキストか写真で送ると目安カロリーとPFCを知ることができます 📸🍽\n\n「1日の合計」と送ると今日の合計も確認できます。"
+          );
+        }
         return;
       }
 
+      // JSON固定で推定（数値安定）
       const ai = await openaiJsonTextFood(text);
       const parsed = parseSingleFood(ai, text);
       const message = formatTextResult(parsed);
 
-      await reply(replyToken, message);
+      if (userId) await push(userId, message);
 
       const cleanName = sanitizeFoodName(parsed.item.name || text) || sanitizeFoodName(text);
       await saveLog(userId, cleanName, parsed.item, today);
     } catch (e) {
       console.error(e);
-      await reply(replyToken, "❌ エラーが発生しました");
+      if (userId) await push(userId, "❌ 解析に失敗しました");
     }
     return;
   }
 
   /* ===== 画像 ===== */
   if (event.message.type === "image") {
-    // replyTokenはこのイベントで1回だけ
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
     try {
@@ -156,7 +159,6 @@ async function handleEvent(event) {
       const parsed = parseMultiFood(ai);
       const message = formatImageResult(parsed);
 
-      // 結果はpush（解析中のreply済みなので）
       if (userId) await push(userId, message);
 
       for (const f of parsed.items) {
@@ -172,7 +174,7 @@ async function handleEvent(event) {
   }
 }
 
-/* ===== JST日付（YYYY-MM-DD） ===== */
+/* ===== JST日付 ===== */
 function getJstDate() {
   const parts = new Intl.DateTimeFormat("ja-JP", {
     timeZone: "Asia/Tokyo",
@@ -213,6 +215,7 @@ async function openai(prompt) {
   const j = await r.json();
   return extractText(j)?.trim() || "";
 }
+
 async function openaiJson(input) {
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -221,6 +224,7 @@ async function openaiJson(input) {
   });
   return await r.json();
 }
+
 async function openaiJsonTextFood(foodText) {
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
