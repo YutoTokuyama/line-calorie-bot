@@ -30,7 +30,28 @@ async function handleEvent(event) {
     const text = event.message.text.trim();
     const lineMessageId = event.message.id;
 
-    // 日付指定合計
+    // ✅ 期間指定（例: 2025-12-01：2025-12-07）
+    const range = parseRangeDate(text);
+    if (range) {
+      const { start, end } = range;
+
+      await reply(replyToken, "📊 期間集計中です…少しお待ちください");
+      const rows = await fetchFoodLogsRange(userId, start, end);
+
+      if (!rows.length) {
+        await push(userId, `📭 ${start}〜${end} の期間に食事ログはありません 🍽`);
+        return;
+      }
+
+      const total = sumRows(rows);
+      const daysMeasured = countDistinctDays(rows); // ✅ ログがある日だけ数える
+      const avg = divideTotal(total, daysMeasured);
+
+      await push(userId, formatRangeMeasuredMessage(start, end, daysMeasured, total, avg));
+      return;
+    }
+
+    // 日付指定合計（単日）
     const sumDate = parseSumDate(text);
     if (sumDate) {
       await reply(replyToken, "📊 集計中です…少しお待ちください");
@@ -44,7 +65,7 @@ async function handleEvent(event) {
       return;
     }
 
-    // 1日の合計
+    // 1日の合計（今日）
     if (text === "1日の合計") {
       await reply(replyToken, "📊 集計中です…少しお待ちください");
       const rows = await fetchFoodLogs(userId, today);
@@ -64,7 +85,7 @@ async function handleEvent(event) {
     if (judge !== "YES") {
       await push(
         userId,
-        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽"
+        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽\n\n例）\n・カレー\n・2025-12-01：2025-12-07"
       );
       return;
     }
@@ -130,7 +151,6 @@ async function handleEvent(event) {
     const ai = await openaiJsonImage(imageUrl);
     const parsed = parseMultiFood(ai);
 
-    // 失敗時は 0kcal を返さずエラー文にする
     if (!parsed.items.length || !isFiniteNumber(parsed.total.kcal) || parsed.total.kcal <= 0) {
       console.error("image parse failed output_text:", extractText(ai));
       await push(
@@ -194,7 +214,6 @@ ${text}
 }
 
 async function openaiJsonImage(imageUrl) {
-  // ✅ 画像も「厳格JSONスキーマ」
   const prompt = `
 出力はJSONのみ。前後に説明文は禁止。
 
@@ -233,7 +252,6 @@ async function openaiJson(input) {
       model: "gpt-4.1-mini",
       input,
       temperature: 0.2,
-      // ✅ JSONモード（壊れた出力を減らす）
       text: { format: { type: "json_object" } },
     }),
   });
@@ -278,6 +296,20 @@ async function fetchFoodLogs(userId, date) {
   const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${encodeURIComponent(
     userId
   )}&eaten_at=eq.${date}`;
+  const r = await fetch(url, {
+    headers: {
+      apikey: process.env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+    },
+  });
+  return await r.json();
+}
+
+async function fetchFoodLogsRange(userId, start, end) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${encodeURIComponent(
+    userId
+  )}&eaten_at=gte.${start}&eaten_at=lte.${end}`;
+
   const r = await fetch(url, {
     headers: {
       apikey: process.env.SUPABASE_ANON_KEY,
@@ -352,6 +384,23 @@ function parseSumDate(text) {
   return null;
 }
 
+// ✅ 「2025-12-01：2025-12-07」みたいに区切りだけでも反応させる
+function parseRangeDate(text) {
+  const m = text.match(/(\d{4}-\d{2}-\d{2}).*?(\d{4}-\d{2}-\d{2})/);
+  if (!m) return null;
+
+  let start = m[1];
+  let end = m[2];
+
+  if (!isValidIsoDate(start) || !isValidIsoDate(end)) return null;
+  if (start > end) [start, end] = [end, start];
+  return { start, end };
+}
+
+function isValidIsoDate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
 /* ===============================
    パース & 表示
 ================================ */
@@ -379,17 +428,13 @@ function num(v) {
 
 function parseMultiFood(ai) {
   const j = tryParseJson(extractText(ai));
-
   const items = (j?.items || []).map(x => ({
     name: x.name,
     kcal: num(x.kcal ?? x.calories),
-    // ✅ p/f/c でも protein/fat/carbs でも拾う
     p: num(x.p ?? x.protein),
     f: num(x.f ?? x.fat),
     c: num(x.c ?? x.carbs),
   }));
-
-  // itemsが空になったら total も0になるので、ここで防げる
   const total = sumRows(items);
   return { items, total, point: j?.point || "" };
 }
@@ -429,6 +474,19 @@ function sumRows(rows) {
   );
 }
 
+function countDistinctDays(rows) {
+  const set = new Set();
+  for (const r of rows) {
+    if (r?.eaten_at) set.add(String(r.eaten_at));
+  }
+  return set.size || 1;
+}
+
+function divideTotal(t, days) {
+  const d = Math.max(1, days || 1);
+  return { kcal: t.kcal / d, p: t.p / d, f: t.f / d, c: t.c / d };
+}
+
 function formatTotalMessage(date, t) {
   return `🍽 ${date} の合計（目安）
 
@@ -439,6 +497,26 @@ function formatTotalMessage(date, t) {
 ・たんぱく質：${t.p.toFixed(1)} g
 ・脂質：${t.f.toFixed(1)} g
 ・炭水化物：${t.c.toFixed(1)} g`;
+}
+
+function formatRangeMeasuredMessage(start, end, daysMeasured, total, avg) {
+  return `📅 ${start}〜${end} の集計
+
+🗓 計測日数：${daysMeasured} 日（ログがある日だけ）
+
+【合計】
+🔥 カロリー：約 ${Math.round(total.kcal)} kcal
+🥗 PFC：
+・たんぱく質：${total.p.toFixed(1)} g
+・脂質：${total.f.toFixed(1)} g
+・炭水化物：${total.c.toFixed(1)} g
+
+【1日あたり平均】
+🔥 カロリー：${Math.round(avg.kcal)} kcal/日
+🥗 PFC：
+・たんぱく質：${avg.p.toFixed(1)} g/日
+・脂質：${avg.f.toFixed(1)} g/日
+・炭水化物：${avg.c.toFixed(1)} g/日`;
 }
 
 function formatTextResult(d) {
@@ -457,7 +535,6 @@ ${d.point || "量や具材で数値は変動します。"}`;
 }
 
 function formatImageResult(d) {
-  // ✅ 画像でもPFCを表示する（合計＋各料理）
   let s = `🍽 推定結果（目安）
 
 🔥 合計
