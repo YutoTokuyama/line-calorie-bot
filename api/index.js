@@ -85,7 +85,31 @@ async function handleEvent(event) {
       return;
     }
 
-    // ✅ 期間指定（例: 2025-12-01：2025-12-07）→ ログがある日だけで割る
+    // ✅ コーチだけ欲しい時（任意コマンド）
+    if (isCoachCommand(text)) {
+      await reply(replyToken, "🤖 コーチ作成中です…少しお待ちください");
+      const rows = await fetchFoodLogs(userId, today);
+      if (!rows.length) {
+        await push(userId, "今日はまだ食事ログがありません 🍽");
+        return;
+      }
+      const total = sumRows(rows);
+      const goal = await fetchGoal(userId);
+      const coach = await buildCoachBlock({
+        scope: "day",
+        dateLabel: today,
+        totalKcal: total.kcal,
+        totalP: total.p,
+        totalF: total.f,
+        totalC: total.c,
+        goalKcal: goal?.calorie_goal ?? null,
+        foods: summarizeFoods(rows),
+      });
+      await push(userId, coach || "🤖 コーチ：アドバイスを作れませんでした（もう一度お試しください）");
+      return;
+    }
+
+    // ✅ 期間指定（例: 2025-12-01：2025-12-07）→ ログがある日だけで割る（平均ベースでコーチ）
     const range = parseRangeDate(text);
     if (range) {
       const { start, end } = range;
@@ -102,8 +126,21 @@ async function handleEvent(event) {
       const daysMeasured = countDistinctDays(rows);
       const avg = divideTotal(total, daysMeasured);
 
-      const goal = await fetchGoal(userId); // { calorie_goal } or null
-      await push(userId, formatRangeMeasuredMessage(start, end, daysMeasured, total, avg, goal?.calorie_goal));
+      const goal = await fetchGoal(userId);
+      const msg = formatRangeMeasuredMessage(start, end, daysMeasured, total, avg, goal?.calorie_goal);
+
+      const coach = await buildCoachBlock({
+        scope: "range",
+        dateLabel: `${start}〜${end}（平均）`,
+        totalKcal: avg.kcal,
+        totalP: avg.p,
+        totalF: avg.f,
+        totalC: avg.c,
+        goalKcal: goal?.calorie_goal ?? null,
+        foods: summarizeFoods(rows), // 期間の代表例として上位を渡す
+      });
+
+      await push(userId, msg + (coach ? `\n\n${coach}` : ""));
       return;
     }
 
@@ -119,7 +156,20 @@ async function handleEvent(event) {
       const total = sumRows(rows);
 
       const goal = await fetchGoal(userId);
-      await push(userId, formatTotalMessage(sumDate, total, goal?.calorie_goal));
+      const msg = formatTotalMessage(sumDate, total, goal?.calorie_goal);
+
+      const coach = await buildCoachBlock({
+        scope: "day",
+        dateLabel: sumDate,
+        totalKcal: total.kcal,
+        totalP: total.p,
+        totalF: total.f,
+        totalC: total.c,
+        goalKcal: goal?.calorie_goal ?? null,
+        foods: summarizeFoods(rows),
+      });
+
+      await push(userId, msg + (coach ? `\n\n${coach}` : ""));
       return;
     }
 
@@ -134,18 +184,31 @@ async function handleEvent(event) {
       const total = sumRows(rows);
 
       const goal = await fetchGoal(userId);
-      await push(userId, formatTotalMessage(today, total, goal?.calorie_goal));
+      const msg = formatTotalMessage(today, total, goal?.calorie_goal);
+
+      const coach = await buildCoachBlock({
+        scope: "day",
+        dateLabel: today,
+        totalKcal: total.kcal,
+        totalP: total.p,
+        totalF: total.f,
+        totalC: total.c,
+        goalKcal: goal?.calorie_goal ?? null,
+        foods: summarizeFoods(rows),
+      });
+
+      await push(userId, msg + (coach ? `\n\n${coach}` : ""));
       return;
     }
 
-    // ✅ 同じテキストでも毎回結果を返す
+    // ✅ 同じテキストでも毎回結果を返す（食事推定）
     await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
 
     const judge = await openai(`${text} は料理名または食材名ですか？YESかNOのみで答えて`);
     if (judge !== "YES") {
       await push(
         userId,
-        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽\n\n例）\n・カレー\n・2025-12-01：2025-12-07\n・目標 2000\n・目標解除\n・直前を取り消し"
+        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽\n\n例）\n・カレー\n・2025-12-01：2025-12-07\n・目標 2000\n・目標解除\n・直前を取り消し\n・コーチ"
       );
       return;
     }
@@ -177,10 +240,10 @@ async function handleEvent(event) {
   if (event.message.type === "image") {
     const lineMessageId = event.message.id;
 
-    // webhook再送（同一 message.id）は即return（通知スパム防止）
+    // webhook再送（同一 message.id）は即return
     if (await existsLogForMessage(userId, lineMessageId)) return;
 
-    // 画像取得 → hash作成（手動で同じ画像でも検知）
+    // 画像取得 → hash作成
     const imgRes = await fetch(
       `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
       { headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` } }
@@ -189,14 +252,15 @@ async function handleEvent(event) {
     const imageHash = crypto.createHash("sha256").update(buf).digest("hex");
 
     // ✅ 同日内の同一画像は計算しない
-    if (await existsImageHashForDate(userId, getJstDate(), imageHash)) {
+    const today = getJstDate();
+    if (await existsImageHashForDate(userId, today, imageHash)) {
       await push(userId, "🔁 同じ画像が送られたため、今回は計算しませんでした。");
       return;
     }
 
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
-    // Cloudinaryへアップ（重複じゃない時だけ）
+    // Cloudinaryへアップ
     const form = new FormData();
     form.append("file", new Blob([buf]));
     form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
@@ -222,7 +286,6 @@ async function handleEvent(event) {
 
     await push(userId, formatImageResult(parsed));
 
-    const today = getJstDate();
     for (let i = 0; i < parsed.items.length; i++) {
       const f = parsed.items[i];
       await saveLog(
@@ -542,11 +605,9 @@ function isUndoCommand(text) {
 /* ---- 目標コマンド ---- */
 function parseGoalSet(text) {
   const t = text.replace(/\s+/g, "");
-  // 例: 目標2000 / 目標:2000 / 目標は2000 / 目標＝2000
   const m = t.match(/^(目標|カロリー目標)([:：=＝は]?)(\d{3,5})$/);
   if (m) return clampGoal(+m[3]);
 
-  // 文中も拾う: "目標 2000" "目標は 2000"
   const m2 = text.match(/(目標|カロリー目標)\s*[:：=＝は]?\s*(\d{3,5})/);
   if (m2) return clampGoal(+m2[2]);
 
@@ -563,6 +624,11 @@ function clampGoal(n) {
 function isGoalClear(text) {
   const t = text.replace(/\s+/g, "");
   return t === "目標解除" || t === "目標を解除" || t === "カロリー目標解除" || t === "目標削除";
+}
+
+function isCoachCommand(text) {
+  const t = text.replace(/\s+/g, "");
+  return t === "コーチ" || t === "アドバイス" || t === "提案" || t === "コーチして";
 }
 
 /* ===============================
@@ -699,7 +765,7 @@ function formatRangeMeasuredMessage(start, end, daysMeasured, total, avg, goalKc
 ・脂質：${avg.f.toFixed(1)} g/日
 ・炭水化物：${avg.c.toFixed(1)} g/日`;
 
-  // ✅ A案：平均（1日平均 ÷ 目標）だけ出す
+  // ✅ A案：平均（1日平均 ÷ 目標）だけ出す（ここは目標ブロックも平均基準）
   const goal = goalKcal
     ? formatGoalBlockFromKcal(goalKcal, avg.kcal, "🎯 1日目標（平均ベース）")
     : "";
@@ -767,6 +833,128 @@ P:${x.p.toFixed(1)}g F:${x.f.toFixed(1)}g C:${x.c.toFixed(1)}g`;
 
 function sanitizeFoodName(n) {
   return String(n || "").split("\n")[0].trim().slice(0, 50);
+}
+
+/* ===============================
+   コーチ（差別化機能）
+================================ */
+// 食品一覧を短く要約（上位6件）
+function summarizeFoods(rows, max = 6) {
+  const map = new Map();
+  for (const r of rows || []) {
+    const name = String(r.food_name || "").trim();
+    if (!name) continue;
+    const kcal = Number(r.calories ?? 0) || 0;
+    map.set(name, (map.get(name) || 0) + kcal);
+  }
+  return [...map.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, max)
+    .map(([name, kcal]) => `${name}(${Math.round(kcal)}kcal)`)
+    .join(" / ");
+}
+
+async function buildCoachBlock({ scope, dateLabel, totalKcal, totalP, totalF, totalC, goalKcal, foods }) {
+  // ざっくり低コストな最低限ガード
+  if (!Number.isFinite(totalKcal) || totalKcal <= 0) return "";
+
+  // OpenAIが落ちた時のフォールバック（ルールベース）
+  const fallback = () => {
+    const p = Number(totalP) || 0;
+    const over = goalKcal ? totalKcal - goalKcal : 0;
+
+    let balance = "バランス：";
+    if (goalKcal) {
+      if (over > 200) balance += "摂取多め（調整余地あり）";
+      else if (over < -300) balance += "摂取少なめ（不足気味）";
+      else balance += "概ねOK";
+    } else {
+      balance += "（目標未設定）";
+    }
+
+    let next = "次の食事提案（コンビニ例）：";
+    if (p < 60) {
+      next += "サラダチキン／ゆで卵／ギリシャヨーグルト（高たんぱく）";
+    } else if (over > 200) {
+      next += "具だくさん味噌汁／サラダ＋ノンオイル／豆腐（脂質控えめ）";
+    } else {
+      next += "おにぎり＋サラダチキン＋野菜スープ（バランス型）";
+    }
+
+    let swap = "おすすめ置換：";
+    if (over > 200) swap += "揚げ物→焼き/蒸し系に（-200kcal目安）";
+    else swap += "甘い飲み物→無糖に（-150〜200kcal目安）";
+
+    return `🤖 コーチ（目安）
+・${balance}
+・${next}
+・${swap}
+※あくまで目安です`;
+  };
+
+  try {
+    const prompt = `
+あなたは食事の“コーチ”です。ユーザーのPFCとカロリー目標に基づき、短く実用的に提案してください。
+出力はJSONのみ（説明文禁止）。
+
+条件:
+- 日本の一般的なコンビニで買える「カテゴリ名」で提案（ブランド名禁止）
+- 医療的な断定は禁止、目安として表現
+- 提案は具体的で、短い箇条書きに向く文にする
+- 「おすすめ置換」は、可能なら foods の中から置換元を選び、同じ満足感で -200kcal 前後を狙う。foodsが空なら一般例でOK。
+
+入力:
+scope: ${scope}（day=1日, range=期間平均）
+dateLabel: ${dateLabel}
+kcal: ${Math.round(totalKcal)}
+p: ${Number(totalP || 0).toFixed(1)}
+f: ${Number(totalF || 0).toFixed(1)}
+c: ${Number(totalC || 0).toFixed(1)}
+goalKcal: ${goalKcal ? Math.round(goalKcal) : "null"}
+foods: ${foods || "（なし）"}
+
+出力JSONスキーマ:
+{
+  "balance": "短い所感（不足/過多と改善方向）",
+  "next_meal": ["コンビニで買える具体例1","具体例2","具体例3"],
+  "swap": "おすすめ置換（-200kcal目安の一文）"
+}
+`.trim();
+
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        input: prompt,
+        temperature: 0.3,
+        text: { format: { type: "json_object" } },
+      }),
+    });
+
+    const j = await r.json();
+    const parsed = tryParseJson(extractText(j));
+    if (!parsed) return fallback();
+
+    const balance = String(parsed.balance || "").trim();
+    const next = Array.isArray(parsed.next_meal) ? parsed.next_meal.map(x => String(x)).filter(Boolean) : [];
+    const swap = String(parsed.swap || "").trim();
+
+    // 変な出力の安全策
+    if (!balance || !next.length || !swap) return fallback();
+
+    return `🤖 コーチ（目安）
+・バランス：${balance}
+・次の食事提案（コンビニ例）：${next.slice(0, 3).join(" / ")}
+・おすすめ置換：${swap}
+※あくまで目安です`;
+  } catch (e) {
+    console.error("coach error:", e);
+    return fallback();
+  }
 }
 
 /* ===============================
