@@ -1,3 +1,5 @@
+import crypto from "crypto";
+
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
   const events = req.body?.events || [];
@@ -26,7 +28,7 @@ async function handleEvent(event) {
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
     const text = event.message.text.trim();
-    const lineMessageId = event.message.id; // 二重送信判定キー
+    const lineMessageId = event.message.id; // 保存のidempotency用（結果返信は毎回する）
 
     // 日付指定合計
     const sumDate = parseSumDate(text);
@@ -55,13 +57,7 @@ async function handleEvent(event) {
       return;
     }
 
-    // webhook再送など同一メッセージの場合は計算しない（コスト節約＆0kcal防止）
-    if (await existsLogForMessage(userId, lineMessageId)) {
-      await push(userId, "🔁 同じメッセージが送られたので計算しませんでした。");
-      return;
-    }
-
-    // 解析中
+    // ✅ 同じテキストでも毎回結果が返るようにする（重複判定で弾かない）
     await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
 
     // 料理判定
@@ -78,29 +74,45 @@ async function handleEvent(event) {
     const parsed = parseSingleFood(ai, text);
     await push(userId, formatTextResult(parsed));
 
-    // item_index=1（テキストは1件想定）
-    await saveLog(userId, sanitizeFoodName(parsed.item.name), parsed.item, today, lineMessageId, 1);
+    // テキストは毎回保存（同じ料理を複数回食べた、にも対応）
+    await saveLog(
+      userId,
+      sanitizeFoodName(parsed.item.name),
+      parsed.item,
+      today,
+      lineMessageId,
+      1,
+      null // image_hashなし
+    );
     return;
   }
 
   /* ===== 画像 ===== */
   if (event.message.type === "image") {
-    const lineMessageId = event.message.id; // 二重送信判定キー
+    const lineMessageId = event.message.id;
 
-    // webhook再送など同一メッセージの場合は計算しない（OpenAI/Cloudinaryをスキップ）
-    if (await existsLogForMessage(userId, lineMessageId)) {
-      await push(userId, "🔁 同じ画像が送られたので計算しませんでした。");
-      return;
-    }
+    // webhook再送（同じ message.id）が来たら無言で終了（通知スパム防止）
+    if (await existsLogForMessage(userId, lineMessageId)) return;
 
-    await reply(replyToken, "📸 解析中です…少しお待ちください");
-
+    // まず画像バイナリを取得（ここでhashを作る）
     const imgRes = await fetch(
       `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
       { headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` } }
     );
     const buf = Buffer.from(await imgRes.arrayBuffer());
 
+    // ✅ 手動で同じ画像を再送しても検知できるように sha256 を取る
+    const imageHash = crypto.createHash("sha256").update(buf).digest("hex");
+
+    // 今日すでに同じ画像が登録されていたら、計算しない（OpenAI/Cloudinaryスキップ）
+    if (await existsImageHashForDate(userId, today, imageHash)) {
+      await push(userId, "🔁 同じ画像が送られたため、今回は計算しませんでした。");
+      return;
+    }
+
+    await reply(replyToken, "📸 解析中です…少しお待ちください");
+
+    // Cloudinaryへアップロード（重複じゃない時だけ）
     const form = new FormData();
     form.append("file", new Blob([buf]));
     form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
@@ -120,7 +132,15 @@ async function handleEvent(event) {
     // 画像は複数料理になるので index を振る
     for (let i = 0; i < parsed.items.length; i++) {
       const f = parsed.items[i];
-      await saveLog(userId, sanitizeFoodName(f.name), f, today, lineMessageId, i + 1);
+      await saveLog(
+        userId,
+        sanitizeFoodName(f.name),
+        f,
+        today,
+        lineMessageId,
+        i + 1,
+        imageHash
+      );
     }
   }
 }
@@ -188,7 +208,7 @@ async function openaiJson(input) {
 /* ===============================
    Supabase
 ================================ */
-async function saveLog(userId, name, f, date, lineMessageId, itemIndex) {
+async function saveLog(userId, name, f, date, lineMessageId, itemIndex, imageHash) {
   // 二重計上防止: (user_id, line_message_id, item_index) でupsert
   const url =
     `${process.env.SUPABASE_URL}/rest/v1/food_logs` +
@@ -212,6 +232,7 @@ async function saveLog(userId, name, f, date, lineMessageId, itemIndex) {
       eaten_at: date,
       line_message_id: lineMessageId,
       item_index: itemIndex,
+      image_hash: imageHash,
     }),
   });
 }
@@ -229,13 +250,32 @@ async function fetchFoodLogs(userId, date) {
   return await r.json();
 }
 
-// すでに同一 message_id のログがあるなら webhook再送とみなしてスキップ
+// webhook再送（同一 message.id）対策：すでに同一message_idのログがあれば true
 async function existsLogForMessage(userId, lineMessageId) {
   if (!userId || !lineMessageId) return false;
 
   const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?select=id&user_id=eq.${encodeURIComponent(
     userId
   )}&line_message_id=eq.${encodeURIComponent(lineMessageId)}&limit=1`;
+
+  const r = await fetch(url, {
+    headers: {
+      apikey: process.env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+    },
+  });
+
+  const j = await r.json().catch(() => []);
+  return Array.isArray(j) && j.length > 0;
+}
+
+// 手動で同じ画像を再送したケース対策：同日内に同じ image_hash があるか
+async function existsImageHashForDate(userId, date, imageHash) {
+  if (!userId || !date || !imageHash) return false;
+
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?select=id&user_id=eq.${encodeURIComponent(
+    userId
+  )}&eaten_at=eq.${date}&image_hash=eq.${encodeURIComponent(imageHash)}&limit=1`;
 
   const r = await fetch(url, {
     headers: {
