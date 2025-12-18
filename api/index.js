@@ -30,6 +30,26 @@ async function handleEvent(event) {
     const text = event.message.text.trim();
     const lineMessageId = event.message.id;
 
+    // ✅ 目標設定（A: 最小）
+    const goalSet = parseGoalSet(text);
+    if (goalSet) {
+      await reply(replyToken, "⚙️ 設定中です…");
+      await upsertGoal(userId, goalSet);
+      await push(
+        userId,
+        `✅ 目標カロリーを設定しました\n\n🎯 1日目標：${goalSet} kcal\n※変更：目標 1800\n※解除：目標解除`
+      );
+      return;
+    }
+
+    // ✅ 目標解除
+    if (isGoalClear(text)) {
+      await reply(replyToken, "⚙️ 解除中です…");
+      await deleteGoal(userId);
+      await push(userId, "✅ 目標カロリーを解除しました");
+      return;
+    }
+
     // ✅ 直前取り消し（最後に保存された “1回分” を削除）
     if (isUndoCommand(text)) {
       await reply(replyToken, "🗑 直前の記録を取り消し中です…");
@@ -40,7 +60,6 @@ async function handleEvent(event) {
         return;
       }
 
-      // まず削除対象を取得（表示用）
       let logsToDelete = [];
       if (last.line_message_id) {
         logsToDelete = await fetchLogsByMessage(userId, last.line_message_id);
@@ -56,7 +75,6 @@ async function handleEvent(event) {
       const total = sumRows(logsToDelete);
       const eatenAt = logsToDelete[0]?.eaten_at || last.eaten_at || today;
 
-      // 削除実行
       if (last.line_message_id) {
         await deleteLogsByMessage(userId, last.line_message_id);
       } else if (last.id) {
@@ -84,7 +102,8 @@ async function handleEvent(event) {
       const daysMeasured = countDistinctDays(rows);
       const avg = divideTotal(total, daysMeasured);
 
-      await push(userId, formatRangeMeasuredMessage(start, end, daysMeasured, total, avg));
+      const goal = await fetchGoal(userId); // { calorie_goal } or null
+      await push(userId, formatRangeMeasuredMessage(start, end, daysMeasured, total, avg, goal?.calorie_goal));
       return;
     }
 
@@ -98,12 +117,14 @@ async function handleEvent(event) {
         return;
       }
       const total = sumRows(rows);
-      await push(userId, formatTotalMessage(sumDate, total));
+
+      const goal = await fetchGoal(userId);
+      await push(userId, formatTotalMessage(sumDate, total, goal?.calorie_goal));
       return;
     }
 
     // 1日の合計（今日）
-    if (text === "1日の合計") {
+    if (text === "1日の合計" || text === "今日の合計") {
       await reply(replyToken, "📊 集計中です…少しお待ちください");
       const rows = await fetchFoodLogs(userId, today);
       if (!rows.length) {
@@ -111,7 +132,9 @@ async function handleEvent(event) {
         return;
       }
       const total = sumRows(rows);
-      await push(userId, formatTotalMessage(today, total));
+
+      const goal = await fetchGoal(userId);
+      await push(userId, formatTotalMessage(today, total, goal?.calorie_goal));
       return;
     }
 
@@ -122,7 +145,7 @@ async function handleEvent(event) {
     if (judge !== "YES") {
       await push(
         userId,
-        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽\n\n例）\n・カレー\n・2025-12-01：2025-12-07\n・直前を取り消し"
+        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽\n\n例）\n・カレー\n・2025-12-01：2025-12-07\n・目標 2000\n・目標解除\n・直前を取り消し"
       );
       return;
     }
@@ -166,7 +189,7 @@ async function handleEvent(event) {
     const imageHash = crypto.createHash("sha256").update(buf).digest("hex");
 
     // ✅ 同日内の同一画像は計算しない
-    if (await existsImageHashForDate(userId, today, imageHash)) {
+    if (await existsImageHashForDate(userId, getJstDate(), imageHash)) {
       await push(userId, "🔁 同じ画像が送られたため、今回は計算しませんでした。");
       return;
     }
@@ -199,6 +222,7 @@ async function handleEvent(event) {
 
     await push(userId, formatImageResult(parsed));
 
+    const today = getJstDate();
     for (let i = 0; i < parsed.items.length; i++) {
       const f = parsed.items[i];
       await saveLog(
@@ -302,7 +326,6 @@ async function openaiJson(input) {
    Supabase
 ================================ */
 function getSupabaseKey() {
-  // 商用は service role 推奨（サーバー側のみで使用）
   return process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 }
 
@@ -381,6 +404,38 @@ async function existsImageHashForDate(userId, date, imageHash) {
   const r = await fetch(url, { headers: supabaseHeaders() });
   const j = await r.json().catch(() => []);
   return Array.isArray(j) && j.length > 0;
+}
+
+/* ---- 目標（user_goals） ---- */
+async function upsertGoal(userId, calorieGoal) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/user_goals?on_conflict=user_id`;
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      ...supabaseHeaders(),
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify({
+      user_id: userId,
+      calorie_goal: calorieGoal,
+      updated_at: new Date().toISOString(),
+    }),
+  });
+}
+
+async function deleteGoal(userId) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/user_goals?user_id=eq.${encodeURIComponent(userId)}`;
+  await fetch(url, { method: "DELETE", headers: supabaseHeaders() });
+}
+
+async function fetchGoal(userId) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/user_goals?select=calorie_goal&user_id=eq.${encodeURIComponent(
+    userId
+  )}&limit=1`;
+
+  const r = await fetch(url, { headers: supabaseHeaders() });
+  const j = await r.json().catch(() => []);
+  return Array.isArray(j) && j.length ? j[0] : null;
 }
 
 /* ---- 直前取り消し用 ---- */
@@ -484,6 +539,32 @@ function isUndoCommand(text) {
   );
 }
 
+/* ---- 目標コマンド ---- */
+function parseGoalSet(text) {
+  const t = text.replace(/\s+/g, "");
+  // 例: 目標2000 / 目標:2000 / 目標は2000 / 目標＝2000
+  const m = t.match(/^(目標|カロリー目標)([:：=＝は]?)(\d{3,5})$/);
+  if (m) return clampGoal(+m[3]);
+
+  // 文中も拾う: "目標 2000" "目標は 2000"
+  const m2 = text.match(/(目標|カロリー目標)\s*[:：=＝は]?\s*(\d{3,5})/);
+  if (m2) return clampGoal(+m2[2]);
+
+  return null;
+}
+
+function clampGoal(n) {
+  if (!Number.isFinite(n)) return null;
+  if (n < 200) return 200;
+  if (n > 10000) return 10000;
+  return Math.round(n);
+}
+
+function isGoalClear(text) {
+  const t = text.replace(/\s+/g, "");
+  return t === "目標解除" || t === "目標を解除" || t === "カロリー目標解除" || t === "目標削除";
+}
+
 /* ===============================
    パース & 表示
 ================================ */
@@ -570,8 +651,22 @@ function divideTotal(t, days) {
   return { kcal: t.kcal / d, p: t.p / d, f: t.f / d, c: t.c / d };
 }
 
-function formatTotalMessage(date, t) {
-  return `🍽 ${date} の合計（目安）
+/* ---- 目標表示 ---- */
+function formatGoalBlockFromKcal(goalKcal, intakeKcal, label = "🎯 1日目標") {
+  if (!goalKcal || !Number.isFinite(goalKcal)) return "";
+  const rate = Math.round((intakeKcal / goalKcal) * 100);
+  const remain = Math.round(goalKcal - intakeKcal);
+  const remainText = remain >= 0 ? `${remain} kcal` : `${remain} kcal（超過）`;
+  return `
+
+${label}：${goalKcal} kcal
+📊 摂取率：${rate}%
+🧮 残り：${remainText}`;
+}
+
+/* ---- メッセージ ---- */
+function formatTotalMessage(date, t, goalKcal) {
+  const base = `🍽 ${date} の合計（目安）
 
 🔥 カロリー
 約 ${Math.round(t.kcal)} kcal
@@ -580,35 +675,43 @@ function formatTotalMessage(date, t) {
 ・たんぱく質：${t.p.toFixed(1)} g
 ・脂質：${t.f.toFixed(1)} g
 ・炭水化物：${t.c.toFixed(1)} g`;
+
+  const goal = goalKcal ? formatGoalBlockFromKcal(goalKcal, t.kcal, "🎯 1日目標") : "";
+  return base + goal;
 }
 
-function formatRangeMeasuredMessage(start, end, daysMeasured, total, avg) {
-  return `📅 ${start}〜${end} の集計
+function formatRangeMeasuredMessage(start, end, daysMeasured, total, avg, goalKcal) {
+  const base = `📅 ${start}〜${end} の集計
 
 🗓 計測日数：${daysMeasured} 日（ログがある日だけ）
 
 【合計】
 🔥 カロリー：約 ${Math.round(total.kcal)} kcal
-🥗 PFC：
+🥗 PFC
 ・たんぱく質：${total.p.toFixed(1)} g
 ・脂質：${total.f.toFixed(1)} g
 ・炭水化物：${total.c.toFixed(1)} g
 
-【1日あたり平均】
+【1日あたり平均（計測日ベース）】
 🔥 カロリー：${Math.round(avg.kcal)} kcal/日
-🥗 PFC：
+🥗 PFC
 ・たんぱく質：${avg.p.toFixed(1)} g/日
 ・脂質：${avg.f.toFixed(1)} g/日
 ・炭水化物：${avg.c.toFixed(1)} g/日`;
+
+  // ✅ A案：平均（1日平均 ÷ 目標）だけ出す
+  const goal = goalKcal
+    ? formatGoalBlockFromKcal(goalKcal, avg.kcal, "🎯 1日目標（平均ベース）")
+    : "";
+
+  return base + goal;
 }
 
 function formatUndoMessage(date, count, total, rows) {
-  // 長くなりすぎないように料理名は最大3件
   const names = rows
     .map(r => r.food_name)
     .filter(Boolean)
     .slice(0, 3);
-
   const more = Math.max(0, count - names.length);
 
   return `🗑 直前の記録を取り消しました（${date}）
