@@ -30,7 +30,44 @@ async function handleEvent(event) {
     const text = event.message.text.trim();
     const lineMessageId = event.message.id;
 
-    // ✅ 期間指定（例: 2025-12-01：2025-12-07）
+    // ✅ 直前取り消し（最後に保存された “1回分” を削除）
+    if (isUndoCommand(text)) {
+      await reply(replyToken, "🗑 直前の記録を取り消し中です…");
+
+      const last = await fetchLastLogMeta(userId);
+      if (!last) {
+        await push(userId, "取り消せる記録がありません。");
+        return;
+      }
+
+      // まず削除対象を取得（表示用）
+      let logsToDelete = [];
+      if (last.line_message_id) {
+        logsToDelete = await fetchLogsByMessage(userId, last.line_message_id);
+      } else if (last.id) {
+        logsToDelete = await fetchLogsById(userId, last.id);
+      }
+
+      if (!logsToDelete.length) {
+        await push(userId, "取り消せる記録が見つかりませんでした。");
+        return;
+      }
+
+      const total = sumRows(logsToDelete);
+      const eatenAt = logsToDelete[0]?.eaten_at || last.eaten_at || today;
+
+      // 削除実行
+      if (last.line_message_id) {
+        await deleteLogsByMessage(userId, last.line_message_id);
+      } else if (last.id) {
+        await deleteLogById(userId, last.id);
+      }
+
+      await push(userId, formatUndoMessage(eatenAt, logsToDelete.length, total, logsToDelete));
+      return;
+    }
+
+    // ✅ 期間指定（例: 2025-12-01：2025-12-07）→ ログがある日だけで割る
     const range = parseRangeDate(text);
     if (range) {
       const { start, end } = range;
@@ -44,7 +81,7 @@ async function handleEvent(event) {
       }
 
       const total = sumRows(rows);
-      const daysMeasured = countDistinctDays(rows); // ✅ ログがある日だけ数える
+      const daysMeasured = countDistinctDays(rows);
       const avg = divideTotal(total, daysMeasured);
 
       await push(userId, formatRangeMeasuredMessage(start, end, daysMeasured, total, avg));
@@ -85,7 +122,7 @@ async function handleEvent(event) {
     if (judge !== "YES") {
       await push(
         userId,
-        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽\n\n例）\n・カレー\n・2025-12-01：2025-12-07"
+        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽\n\n例）\n・カレー\n・2025-12-01：2025-12-07\n・直前を取り消し"
       );
       return;
     }
@@ -264,6 +301,20 @@ async function openaiJson(input) {
 /* ===============================
    Supabase
 ================================ */
+function getSupabaseKey() {
+  // 商用は service role 推奨（サーバー側のみで使用）
+  return process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+}
+
+function supabaseHeaders() {
+  const key = getSupabaseKey();
+  return {
+    "Content-Type": "application/json",
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+  };
+}
+
 async function saveLog(userId, name, f, date, lineMessageId, itemIndex, imageHash) {
   const url =
     `${process.env.SUPABASE_URL}/rest/v1/food_logs` +
@@ -272,9 +323,7 @@ async function saveLog(userId, name, f, date, lineMessageId, itemIndex, imageHas
   await fetch(url, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      apikey: process.env.SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+      ...supabaseHeaders(),
       Prefer: "resolution=merge-duplicates,return=minimal",
     },
     body: JSON.stringify({
@@ -296,12 +345,8 @@ async function fetchFoodLogs(userId, date) {
   const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${encodeURIComponent(
     userId
   )}&eaten_at=eq.${date}`;
-  const r = await fetch(url, {
-    headers: {
-      apikey: process.env.SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
-    },
-  });
+
+  const r = await fetch(url, { headers: supabaseHeaders() });
   return await r.json();
 }
 
@@ -310,12 +355,7 @@ async function fetchFoodLogsRange(userId, start, end) {
     userId
   )}&eaten_at=gte.${start}&eaten_at=lte.${end}`;
 
-  const r = await fetch(url, {
-    headers: {
-      apikey: process.env.SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
-    },
-  });
+  const r = await fetch(url, { headers: supabaseHeaders() });
   return await r.json();
 }
 
@@ -326,13 +366,7 @@ async function existsLogForMessage(userId, lineMessageId) {
     userId
   )}&line_message_id=eq.${encodeURIComponent(lineMessageId)}&limit=1`;
 
-  const r = await fetch(url, {
-    headers: {
-      apikey: process.env.SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
-    },
-  });
-
+  const r = await fetch(url, { headers: supabaseHeaders() });
   const j = await r.json().catch(() => []);
   return Array.isArray(j) && j.length > 0;
 }
@@ -344,15 +378,54 @@ async function existsImageHashForDate(userId, date, imageHash) {
     userId
   )}&eaten_at=eq.${date}&image_hash=eq.${encodeURIComponent(imageHash)}&limit=1`;
 
-  const r = await fetch(url, {
-    headers: {
-      apikey: process.env.SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
-    },
-  });
-
+  const r = await fetch(url, { headers: supabaseHeaders() });
   const j = await r.json().catch(() => []);
   return Array.isArray(j) && j.length > 0;
+}
+
+/* ---- 直前取り消し用 ---- */
+async function fetchLastLogMeta(userId) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?select=id,line_message_id,eaten_at,created_at&user_id=eq.${encodeURIComponent(
+    userId
+  )}&order=created_at.desc&limit=1`;
+
+  const r = await fetch(url, { headers: supabaseHeaders() });
+  const j = await r.json().catch(() => []);
+  return Array.isArray(j) && j.length ? j[0] : null;
+}
+
+async function fetchLogsByMessage(userId, lineMessageId) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?select=food_name,calories,protein,fat,carbs,eaten_at,item_index&user_id=eq.${encodeURIComponent(
+    userId
+  )}&line_message_id=eq.${encodeURIComponent(lineMessageId)}&order=item_index.asc`;
+
+  const r = await fetch(url, { headers: supabaseHeaders() });
+  return await r.json().catch(() => []);
+}
+
+async function fetchLogsById(userId, id) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?select=food_name,calories,protein,fat,carbs,eaten_at,item_index&user_id=eq.${encodeURIComponent(
+    userId
+  )}&id=eq.${encodeURIComponent(id)}&limit=1`;
+
+  const r = await fetch(url, { headers: supabaseHeaders() });
+  return await r.json().catch(() => []);
+}
+
+async function deleteLogsByMessage(userId, lineMessageId) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${encodeURIComponent(
+    userId
+  )}&line_message_id=eq.${encodeURIComponent(lineMessageId)}`;
+
+  await fetch(url, { method: "DELETE", headers: supabaseHeaders() });
+}
+
+async function deleteLogById(userId, id) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${encodeURIComponent(
+    userId
+  )}&id=eq.${encodeURIComponent(id)}`;
+
+  await fetch(url, { method: "DELETE", headers: supabaseHeaders() });
 }
 
 /* ===============================
@@ -384,14 +457,13 @@ function parseSumDate(text) {
   return null;
 }
 
-// ✅ 「2025-12-01：2025-12-07」みたいに区切りだけでも反応させる
+// 期間（区切りだけでもOK）
 function parseRangeDate(text) {
   const m = text.match(/(\d{4}-\d{2}-\d{2}).*?(\d{4}-\d{2}-\d{2})/);
   if (!m) return null;
 
   let start = m[1];
   let end = m[2];
-
   if (!isValidIsoDate(start) || !isValidIsoDate(end)) return null;
   if (start > end) [start, end] = [end, start];
   return { start, end };
@@ -399,6 +471,17 @@ function parseRangeDate(text) {
 
 function isValidIsoDate(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function isUndoCommand(text) {
+  const t = text.replace(/\s+/g, "");
+  return (
+    t === "直前を取り消し" ||
+    t === "直前を取消し" ||
+    t === "直前を削除" ||
+    t === "取り消し" ||
+    t === "取消し"
+  );
 }
 
 /* ===============================
@@ -517,6 +600,29 @@ function formatRangeMeasuredMessage(start, end, daysMeasured, total, avg) {
 ・たんぱく質：${avg.p.toFixed(1)} g/日
 ・脂質：${avg.f.toFixed(1)} g/日
 ・炭水化物：${avg.c.toFixed(1)} g/日`;
+}
+
+function formatUndoMessage(date, count, total, rows) {
+  // 長くなりすぎないように料理名は最大3件
+  const names = rows
+    .map(r => r.food_name)
+    .filter(Boolean)
+    .slice(0, 3);
+
+  const more = Math.max(0, count - names.length);
+
+  return `🗑 直前の記録を取り消しました（${date}）
+
+削除：${count} 件
+${names.length ? "内容：" + names.join(" / ") + (more ? ` ほか${more}件` : "") : ""}
+
+🔥 合計
+約 ${Math.round(total.kcal)} kcal
+
+🥗 PFC
+・たんぱく質：${total.p.toFixed(1)} g
+・脂質：${total.f.toFixed(1)} g
+・炭水化物：${total.c.toFixed(1)} g`;
 }
 
 function formatTextResult(d) {
