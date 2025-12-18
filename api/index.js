@@ -1,6 +1,5 @@
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
-
   const events = req.body?.events || [];
   if (!events.length) return res.status(200).end();
 
@@ -8,191 +7,193 @@ export default async function handler(req, res) {
     try {
       await handleEvent(event);
     } catch (e) {
-      console.error("handleEvent error:", e);
+      console.error("event error:", e);
     }
   }
-  return res.status(200).end();
+  res.status(200).end();
 }
 
+/* ===============================
+   メイン処理
+================================ */
 async function handleEvent(event) {
   const replyToken = event.replyToken;
   const userId = event.source?.userId;
+  if (!event.message || !userId) return;
+
   const today = getJstDate();
-  if (!event.message?.type) return;
 
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
     const text = event.message.text.trim();
 
-    // 日付指定の合計
+    // 日付指定合計
     const sumDate = parseSumDate(text);
     if (sumDate) {
       await reply(replyToken, "📊 集計中です…少しお待ちください");
-      try {
-        const rows = await fetchFoodLogs(userId, sumDate);
-
-        if (!rows.length) {
-          // 年ズレ/日ズレの可能性をユーザーに明示
-          await push(
-            userId,
-            `${sumDate} は食事ログがありません 🍽\n\n（もし「12/17」のように年なし指定の場合、年がズレている可能性があります。例：2025-12-17 の合計）`
-          );
-          return;
-        }
-
-        let kcal = 0, p = 0, f = 0, c = 0;
-        rows.forEach(x => { kcal += x.calories; p += x.protein; f += x.fat; c += x.carbs; });
-
-        await push(
-          userId,
-          `🍽 ${sumDate} の合計（目安）
-
-🔥 カロリー
-約 ${Math.round(kcal)} kcal
-
-🥗 PFCバランス
-・たんぱく質：${p.toFixed(1)} g
-・脂質：${f.toFixed(1)} g
-・炭水化物：${c.toFixed(1)} g`
-        );
-      } catch (e) {
-        console.error(e);
-        await push(userId, "❌ 集計に失敗しました");
-      }
-      return;
-    }
-
-    // 今日の合計（既存）
-    if (text === "1日の合計") {
-      await reply(replyToken, "📊 集計中です…少しお待ちください");
-      try {
-        const rows = await fetchFoodLogs(userId, today);
-        if (!rows.length) {
-          await push(userId, "今日はまだ食事ログがありません 🍽");
-          return;
-        }
-
-        let kcal = 0, p = 0, f = 0, c = 0;
-        rows.forEach(x => { kcal += x.calories; p += x.protein; f += x.fat; c += x.carbs; });
-
-        await push(
-          userId,
-          `🍽 1日の合計（目安）
-
-🔥 カロリー
-約 ${Math.round(kcal)} kcal
-
-🥗 PFCバランス
-・たんぱく質：${p.toFixed(1)} g
-・脂質：${f.toFixed(1)} g
-・炭水化物：${c.toFixed(1)} g`
-        );
-      } catch (e) {
-        console.error(e);
-        await push(userId, "❌ 集計に失敗しました");
-      }
-      return;
-    }
-
-    // 以降はあなたの既存ロジック（解析中→push 等）をそのまま
-    await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
-
-    try {
-      const judge = await openai(`${text} は料理名または食材名ですか？YESかNOのみで答えて`);
-      if (judge !== "YES") {
-        await push(
-          userId,
-          "料理や食材をテキストか写真で送ると目安カロリーとPFCを知ることができます 📸🍽\n\n「昨日の合計」「2025-12-17の合計」など日付指定でも集計できます。"
-        );
+      const rows = await fetchFoodLogs(userId, sumDate);
+      if (!rows.length) {
+        await push(userId, `${sumDate} に食事ログはありません 🍽`);
         return;
       }
-
-      const ai = await openaiJsonTextFood(text);
-      const parsed = parseSingleFood(ai, text);
-      const message = formatTextResult(parsed);
-
-      await push(userId, message);
-
-      const cleanName = sanitizeFoodName(parsed.item.name || text) || sanitizeFoodName(text);
-      await saveLog(userId, cleanName, parsed.item, today);
-    } catch (e) {
-      console.error(e);
-      await push(userId, "❌ 解析に失敗しました");
+      const total = sumRows(rows);
+      await push(userId, formatTotalMessage(sumDate, total));
+      return;
     }
+
+    // 1日の合計
+    if (text === "1日の合計") {
+      await reply(replyToken, "📊 集計中です…少しお待ちください");
+      const rows = await fetchFoodLogs(userId, today);
+      if (!rows.length) {
+        await push(userId, "今日はまだ食事ログがありません 🍽");
+        return;
+      }
+      const total = sumRows(rows);
+      await push(userId, formatTotalMessage(today, total));
+      return;
+    }
+
+    // 解析中
+    await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
+
+    // 料理判定
+    const judge = await openai(`${text} は料理名または食材名ですか？YESかNOのみで答えて`);
+    if (judge !== "YES") {
+      await push(
+        userId,
+        "料理や食材をテキストか写真で送ると、目安カロリーとPFCを知ることができます 📸🍽"
+      );
+      return;
+    }
+
+    const ai = await openaiJsonTextFood(text);
+    const parsed = parseSingleFood(ai, text);
+    await push(userId, formatTextResult(parsed));
+
+    await saveLog(userId, sanitizeFoodName(parsed.item.name), parsed.item, today);
     return;
   }
 
-  /* ===== 画像（あなたの既存処理のまま） ===== */
+  /* ===== 画像 ===== */
   if (event.message.type === "image") {
     await reply(replyToken, "📸 解析中です…少しお待ちください");
 
-    try {
-      const img = await fetch(
-        `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
-        { headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` } }
-      );
-      const buf = Buffer.from(await img.arrayBuffer());
+    const imgRes = await fetch(
+      `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
+      { headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` } }
+    );
+    const buf = Buffer.from(await imgRes.arrayBuffer());
 
-      const form = new FormData();
-      form.append("file", new Blob([buf]));
-      form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
+    const form = new FormData();
+    form.append("file", new Blob([buf]));
+    form.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET);
 
-      const up = await fetch(
-        `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
-        { method: "POST", body: form }
-      );
-      const upJson = await up.json();
-      const imageUrl = upJson.secure_url;
+    const up = await fetch(
+      `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
+      { method: "POST", body: form }
+    );
+    const upJson = await up.json();
+    const imageUrl = upJson.secure_url;
 
-      const ai = await openaiJson([
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: `
-あなたは栄養計算アシスタントです。画像から料理・食材をできるだけ特定し、推定のカロリーとPFCを出してください。
-出力は「JSONのみ」。前後に説明文やコードブロックは禁止です。
+    const ai = await openaiJsonImage(imageUrl);
+    const parsed = parseMultiFood(ai);
 
-【JSONスキーマ（厳守）】
-{
-  "total": { "kcal": number, "p": number, "f": number, "c": number },
-  "items": [
-    { "name": string, "kcal": number, "p": number, "f": number, "c": number }
-  ],
-  "point": string
-}
-              `.trim(),
-            },
-            { type: "input_image", image_url: imageUrl },
-          ],
-        },
-      ]);
+    await push(userId, formatImageResult(parsed));
 
-      const parsed = parseMultiFood(ai);
-      const message = formatImageResult(parsed);
-
-      await push(userId, message);
-
-      for (const f of parsed.items) {
-        const cleanName = sanitizeFoodName(f.name);
-        if (!cleanName) continue;
-        await saveLog(userId, cleanName, f, getJstDate());
-      }
-    } catch (e) {
-      console.error(e);
-      await push(userId, "❌ 解析に失敗しました");
+    for (const f of parsed.items) {
+      await saveLog(userId, sanitizeFoodName(f.name), f, today);
     }
-    return;
   }
 }
 
-/* ===== Supabase 集計用（URL安全化） ===== */
-async function fetchFoodLogs(userId, date) {
-  const uid = encodeURIComponent(userId || "");
-  const d = encodeURIComponent(date || "");
-  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${uid}&eaten_at=eq.${d}`;
+/* ===============================
+   OpenAI
+================================ */
+async function openai(prompt) {
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({ model: "gpt-4.1-mini", input: prompt }),
+  });
+  const j = await r.json();
+  return extractText(j)?.trim();
+}
 
+async function openaiJsonTextFood(text) {
+  return openaiJson(`
+出力はJSONのみ。前後に説明文は禁止。
+
+{
+ "total": { "kcal": number, "p": number, "f": number, "c": number },
+ "items": [{ "name": string, "kcal": number, "p": number, "f": number, "c": number }],
+ "point": string
+}
+
+ルール:
+- 原則 items は1件（料理名そのもの）
+- 材料分解は禁止
+- totalはitems合計と一致
+
+料理名:
+${text}
+`);
+}
+
+async function openaiJsonImage(imageUrl) {
+  return openaiJson([
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "料理とカロリー・PFCをJSONで推定してください" },
+        { type: "input_image", image_url: imageUrl },
+      ],
+    },
+  ]);
+}
+
+async function openaiJson(input) {
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({ model: "gpt-4.1-mini", input }),
+  });
+  return await r.json();
+}
+
+/* ===============================
+   Supabase
+================================ */
+async function saveLog(userId, name, f, date) {
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/food_logs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: process.env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+    },
+    body: JSON.stringify({
+      user_id: userId,
+      food_name: name,
+      calories: Math.round(f.kcal),
+      protein: f.p,
+      fat: f.f,
+      carbs: f.c,
+      eaten_at: date,
+    }),
+  });
+}
+
+async function fetchFoodLogs(userId, date) {
+  const url = `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${encodeURIComponent(
+    userId
+  )}&eaten_at=eq.${date}`;
   const r = await fetch(url, {
     headers: {
       apikey: process.env.SUPABASE_ANON_KEY,
@@ -202,307 +203,152 @@ async function fetchFoodLogs(userId, date) {
   return await r.json();
 }
 
-/* ===== 日付指定パース（JST固定＆年跨ぎ対応） ===== */
+/* ===============================
+   JST 日付（完全安定）
+================================ */
+function getJstDate() {
+  const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(
+    d.getUTCDate()
+  ).padStart(2, "0")}`;
+}
+
+function shiftJstDate(days) {
+  const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  d.setUTCDate(d.getUTCDate() + days);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(
+    d.getUTCDate()
+  ).padStart(2, "0")}`;
+}
+
 function parseSumDate(text) {
-  if (!/合計/.test(text)) return null;
-  if (text === "1日の合計") return null;
+  if (!text.includes("合計")) return null;
+  if (text === "昨日の合計") return shiftJstDate(-1);
+  if (text === "一昨日の合計") return shiftJstDate(-2);
+  if (text === "今日の合計") return getJstDate();
 
-  // 注意：一昨日は「昨日」を含むので先に判定
-  if (/一昨日/.test(text)) return shiftJstDate(-2);
-  if (/昨日/.test(text)) return shiftJstDate(-1);
-  if (/今日/.test(text)) return getJstDate();
-
-  // YYYY-MM-DD
   const iso = text.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-
-  // MM/DD or M/D
-  const mdSlash = text.match(/(\d{1,2})\/(\d{1,2})/);
-  if (mdSlash) return resolveYearForMonthDay(Number(mdSlash[1]), Number(mdSlash[2]));
-
-  // 12月17日
-  const mdKanji = text.match(/(\d{1,2})月(\d{1,2})日/);
-  if (mdKanji) return resolveYearForMonthDay(Number(mdKanji[1]), Number(mdKanji[2]));
-
   return null;
 }
 
-// ★年なし日付を「近い方」に寄せる（1月に12/xxを打った時などのズレ防止）
-function resolveYearForMonthDay(month, day) {
-  const y = Number(getJstYear());
-  const m = String(month).padStart(2, "0");
-  const d = String(day).padStart(2, "0");
-
-  const today = getJstDate(); // YYYY-MM-DD
-  const candidate = `${y}-${m}-${d}`;
-
-  // candidateが「未来日」なら前年にする（年跨ぎ対応）
-  if (candidate > today) {
-    return `${y - 1}-${m}-${d}`;
-  }
-  return candidate;
-}
-
-// ★JST(+09:00)を使って確実に日付をずらす（locale文字列→Dateを廃止）
-function shiftJstDate(days) {
-  const base = getJstDate(); // YYYY-MM-DD
-  const dt = new Date(`${base}T00:00:00+09:00`);
-  dt.setDate(dt.getDate() + days);
-
-  const y = dt.getFullYear();
-  const m = String(dt.getMonth() + 1).padStart(2, "0");
-  const d = String(dt.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
-
-function getJstYear() {
-  const parts = new Intl.DateTimeFormat("ja-JP", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-  }).formatToParts(new Date());
-  return parts.find(p => p.type === "year")?.value;
-}
-
-function getJstDate() {
-  const parts = new Intl.DateTimeFormat("ja-JP", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
-  const y = parts.find(p => p.type === "year")?.value;
-  const m = parts.find(p => p.type === "month")?.value;
-  const d = parts.find(p => p.type === "day")?.value;
-  return `${y}-${m}-${d}`;
-}
-
-/* ===== ここから下は「あなたの既存関数」をそのまま（省略せず全部必要） ===== */
-function sanitizeFoodName(name) {
-  if (!name) return "";
-  let s = String(name).split("\n")[0];
-  const cutWords = ["カロリー", "PFC", "たんぱく質", "脂質", "炭水化物", "推定結果", "合計", "総計"];
-  for (const w of cutWords) {
-    const idx = s.indexOf(w);
-    if (idx > 0) s = s.slice(0, idx);
-  }
-  s = s.replace(/^[\s]*[①-⑨0-9]+[)\]）\.．:\s-]*/g, "");
-  s = s.replace(/^[\s]*[・\-–—]+/g, "");
-  s = s.trim();
-  if (!s) return "";
-  if (s.length > 50) return s.slice(0, 50).trim();
-  return s;
-}
-
-async function openai(prompt) {
-  const r = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-    body: JSON.stringify({ model: "gpt-4.1-mini", input: prompt }),
-  });
-  const j = await r.json();
-  return extractText(j)?.trim() || "";
-}
-
-async function openaiJson(input) {
-  const r = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-    body: JSON.stringify({ model: "gpt-4.1-mini", input }),
-  });
-  return await r.json();
-}
-
-async function openaiJsonTextFood(foodText) {
-  const r = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-    body: JSON.stringify({
-      model: "gpt-4.1-mini",
-      input: `
-出力はJSONのみ。前後に説明文やコードブロックは禁止。
-
-{
-  "total": { "kcal": number, "p": number, "f": number, "c": number },
-  "items": [
-    { "name": string, "kcal": number, "p": number, "f": number, "c": number }
-  ],
-  "point": string
-}
-
-ルール：
-- 原則 items は1件で、料理名そのものを name に入れる（例：牛丼、焼きうどん）
-- 材料への分解は禁止
-- セット内容が明確に書かれている場合のみ items 複数OK
-- total は items の合計と一致させる
-
-料理/食材名：
-${foodText}
-      `.trim(),
-    }),
-  });
-  return await r.json();
-}
-
-async function saveLog(userId, name, f, date) {
-  if (!userId) return;
-  await fetch(`${process.env.SUPABASE_URL}/rest/v1/food_logs`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: process.env.SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
-      Prefer: "return=minimal",
-    },
-    body: JSON.stringify({
-      user_id: userId,
-      food_name: name,
-      calories: Math.round(Number(f.kcal || 0)),
-      protein: Number(f.p || 0),
-      fat: Number(f.f || 0),
-      carbs: Number(f.c || 0),
-      eaten_at: date,
-    }),
-  });
-}
-
-function extractText(aiData) {
-  try {
-    for (const item of aiData.output || []) {
-      for (const c of item.content || []) {
-        if (c.type === "output_text" && c.text) return c.text;
-      }
+/* ===============================
+   パース & 表示
+================================ */
+function extractText(ai) {
+  for (const o of ai.output || []) {
+    for (const c of o.content || []) {
+      if (c.type === "output_text") return c.text;
     }
-  } catch {}
-  return null;
+  }
+  return "";
 }
 
-function tryParseJson(text) {
+function tryParseJson(t) {
   try {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start) return null;
-    return JSON.parse(text.slice(start, end + 1));
+    return JSON.parse(t.slice(t.indexOf("{"), t.lastIndexOf("}") + 1));
   } catch {
     return null;
   }
 }
 
 function parseMultiFood(ai) {
-  const raw = extractText(ai) || "";
-  const j = tryParseJson(raw);
-  if (j && j.items) {
-    const items = (j.items || [])
-      .filter(x => x && x.name && !/合計|総計/i.test(String(x.name)))
-      .map(x => ({ name: String(x.name), kcal: +x.kcal || 0, p: +x.p || 0, f: +x.f || 0, c: +x.c || 0 }));
-
-    const total = items.reduce(
-      (a, x) => (a.kcal += x.kcal, a.p += x.p, a.f += x.f, a.c += x.c, a),
-      { kcal: 0, p: 0, f: 0, c: 0 }
-    );
-    return { total, items, point: String(j.point || ""), raw };
-  }
-  return { total: { kcal: 0, p: 0, f: 0, c: 0 }, items: [], point: "", raw };
+  const j = tryParseJson(extractText(ai));
+  const items = (j?.items || []).map(x => ({
+    name: x.name,
+    kcal: +x.kcal,
+    p: +x.p,
+    f: +x.f,
+    c: +x.c,
+  }));
+  const total = sumRows(items);
+  return { items, total, point: j?.point || "" };
 }
 
-function parseSingleFood(ai, fallbackName) {
-  const raw = extractText(ai) || "";
-  const j = tryParseJson(raw);
-  if (j && j.items) {
-    let items = (j.items || [])
-      .filter(x => x && x.name && !/合計|総計/i.test(String(x.name)))
-      .map(x => ({ name: String(x.name), kcal: +x.kcal || 0, p: +x.p || 0, f: +x.f || 0, c: +x.c || 0 }));
-
-    const looksIngredient = items.length >= 2 && items.every(it => it.name.length <= 10);
-    if (looksIngredient) {
-      const sum = items.reduce(
-        (a, x) => (a.kcal += x.kcal, a.p += x.p, a.f += x.f, a.c += x.c, a),
-        { kcal: 0, p: 0, f: 0, c: 0 }
-      );
-      items = [{ name: fallbackName, ...sum }];
-    }
-
-    const total = items.reduce(
-      (a, x) => (a.kcal += x.kcal, a.p += x.p, a.f += x.f, a.c += x.c, a),
-      { kcal: 0, p: 0, f: 0, c: 0 }
-    );
-
-    const first = items[0] || { name: fallbackName, kcal: 0, p: 0, f: 0, c: 0 };
-    return { total, item: first, point: String(j.point || "") };
-  }
-
-  return { total: { kcal: 0, p: 0, f: 0, c: 0 }, item: { name: fallbackName, kcal: 0, p: 0, f: 0, c: 0 }, point: "" };
+function parseSingleFood(ai, fallback) {
+  const j = tryParseJson(extractText(ai));
+  const item = j?.items?.[0] || { name: fallback, kcal: 0, p: 0, f: 0, c: 0 };
+  return { item, total: item, point: j?.point || "" };
 }
 
-function formatImageResult(d) {
-  if (!d.items.length) return d.raw ? `🍽 推定結果（目安）\n\n${d.raw}` : "解析できませんでした";
-  let s =
-`🍽 推定結果（目安）
+function sumRows(rows) {
+  return rows.reduce(
+    (a, x) => ({
+      kcal: a.kcal + x.calories ?? x.kcal,
+      p: a.p + x.protein ?? x.p,
+      f: a.f + x.fat ?? x.f,
+      c: a.c + x.carbs ?? x.c,
+    }),
+    { kcal: 0, p: 0, f: 0, c: 0 }
+  );
+}
 
-🔥 合計
-カロリー：約 ${Math.round(d.total.kcal)} kcal
-PFC
-・たんぱく質：${d.total.p.toFixed(1)} g
-・脂質：${d.total.f.toFixed(1)} g
-・炭水化物：${d.total.c.toFixed(1)} g
+function formatTotalMessage(date, t) {
+  return `🍽 ${date} の合計（目安）
 
-――――――――――
-【内訳】`;
-  d.items.forEach((x, i) => {
-    s += `
+🔥 カロリー
+約 ${Math.round(t.kcal)} kcal
 
-${i + 1}) ${sanitizeFoodName(x.name)}
-カロリー：約 ${Math.round(x.kcal)} kcal
-PFC
-・たんぱく質：${x.p.toFixed(1)} g
-・脂質：${x.f.toFixed(1)} g
-・炭水化物：${x.c.toFixed(1)} g`;
-  });
-  s += `
-
-✅ ポイント
-${d.point || "量や具材で数値は変動します。必要なら量も送ると精度が上がります。"}`;
-  return s;
+🥗 PFCバランス
+・たんぱく質：${t.p.toFixed(1)} g
+・脂質：${t.f.toFixed(1)} g
+・炭水化物：${t.c.toFixed(1)} g`;
 }
 
 function formatTextResult(d) {
-  const name = sanitizeFoodName(d.item.name) || "（料理名不明）";
   return `🍽 推定結果（目安）
 
-🔥 合計
-カロリー：約 ${Math.round(d.total.kcal)} kcal
-PFC
-・たんぱく質：${d.total.p.toFixed(1)} g
-・脂質：${d.total.f.toFixed(1)} g
-・炭水化物：${d.total.c.toFixed(1)} g
+🔥 カロリー
+約 ${Math.round(d.item.kcal)} kcal
 
-――――――――――
-【内訳】
-
-1) ${name}
-カロリー：約 ${Math.round(d.item.kcal)} kcal
-PFC
+🥗 PFCバランス
 ・たんぱく質：${d.item.p.toFixed(1)} g
 ・脂質：${d.item.f.toFixed(1)} g
 ・炭水化物：${d.item.c.toFixed(1)} g
 
 ✅ ポイント
-${d.point || "量や具材で数値は変動します。必要なら量も送ると精度が上がります。"}`;
+${d.point || "量や具材で数値は変動します。"}`;
 }
 
+function formatImageResult(d) {
+  let s = `🍽 推定結果（目安）
+
+🔥 合計
+約 ${Math.round(d.total.kcal)} kcal`;
+  d.items.forEach((x, i) => {
+    s += `
+
+${i + 1}) ${x.name}
+約 ${Math.round(x.kcal)} kcal`;
+  });
+  return s;
+}
+
+function sanitizeFoodName(n) {
+  return String(n || "").split("\n")[0].trim().slice(0, 50);
+}
+
+/* ===============================
+   LINE
+================================ */
 async function reply(token, text) {
-  const r = await fetch("https://api.line.me/v2/bot/message/reply", {
+  await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
     body: JSON.stringify({ replyToken: token, messages: [{ type: "text", text }] }),
   });
-  if (!r.ok) console.log("LINE reply failed:", r.status, await r.text());
 }
 
 async function push(userId, text) {
-  const r = await fetch("https://api.line.me/v2/bot/message/push", {
+  await fetch("https://api.line.me/v2/bot/message/push", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
     body: JSON.stringify({ to: userId, messages: [{ type: "text", text }] }),
   });
-  if (!r.ok) console.log("LINE push failed:", r.status, await r.text());
 }
