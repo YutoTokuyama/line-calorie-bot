@@ -20,29 +20,20 @@ async function handleEvent(event) {
   const replyToken = event.replyToken;
   const userId = event.source?.userId;
   const today = getJstDate();
-
   if (!event.message?.type) return;
 
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
     const text = event.message.text.trim();
 
-    /* --- 1日の合計（これは即時返信のままでOK） --- */
-    if (text === "1日の合計") {
+    /* --- 日付指定の合計（ここを追加） --- */
+    const sumDate = parseSumDate(text);
+    if (sumDate) {
+      await reply(replyToken, "📊 集計中です…少しお待ちください");
       try {
-        const r = await fetch(
-          `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${userId}&eaten_at=eq.${today}`,
-          {
-            headers: {
-              apikey: process.env.SUPABASE_ANON_KEY,
-              Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
-            },
-          }
-        );
-        const rows = await r.json();
-
+        const rows = await fetchFoodLogs(userId, sumDate);
         if (!rows.length) {
-          await reply(replyToken, "今日はまだ食事ログがありません 🍽");
+          await push(userId, `${sumDate} はまだ食事ログがありません 🍽`);
           return;
         }
 
@@ -54,8 +45,45 @@ async function handleEvent(event) {
           c += x.carbs;
         });
 
-        await reply(
-          replyToken,
+        await push(
+          userId,
+          `🍽 ${sumDate} の合計（目安）
+
+🔥 カロリー
+約 ${Math.round(kcal)} kcal
+
+🥗 PFCバランス
+・たんぱく質：${p.toFixed(1)} g
+・脂質：${f.toFixed(1)} g
+・炭水化物：${c.toFixed(1)} g`
+        );
+      } catch (e) {
+        console.error(e);
+        await push(userId, "❌ 集計に失敗しました");
+      }
+      return;
+    }
+
+    /* --- 今日の合計（従来のコマンドも残す） --- */
+    if (text === "1日の合計") {
+      await reply(replyToken, "📊 集計中です…少しお待ちください");
+      try {
+        const rows = await fetchFoodLogs(userId, today);
+        if (!rows.length) {
+          await push(userId, "今日はまだ食事ログがありません 🍽");
+          return;
+        }
+
+        let kcal = 0, p = 0, f = 0, c = 0;
+        rows.forEach(x => {
+          kcal += x.calories;
+          p += x.protein;
+          f += x.fat;
+          c += x.carbs;
+        });
+
+        await push(
+          userId,
           `🍽 1日の合計（目安）
 
 🔥 カロリー
@@ -68,13 +96,12 @@ async function handleEvent(event) {
         );
       } catch (e) {
         console.error(e);
-        await reply(replyToken, "❌ 集計に失敗しました");
+        await push(userId, "❌ 集計に失敗しました");
       }
       return;
     }
 
-    /* --- ここから：テキストも「解析中」→ pushで結果 --- */
-    // replyTokenはこのイベントで1回だけ使う
+    /* --- ここから：テキストは「解析中」→ pushで結果 --- */
     await reply(replyToken, "⌨️ 解析中です…少しお待ちください");
 
     try {
@@ -83,13 +110,12 @@ async function handleEvent(event) {
         if (userId) {
           await push(
             userId,
-            "料理や食材をテキストか写真で送ると目安カロリーとPFCを知ることができます 📸🍽\n\n「1日の合計」と送ると今日の合計も確認できます。"
+            "料理や食材をテキストか写真で送ると目安カロリーとPFCを知ることができます 📸🍽\n\n「昨日の合計」「2025-12-17の合計」など日付指定でも集計できます。"
           );
         }
         return;
       }
 
-      // JSON固定で推定（数値安定）
       const ai = await openaiJsonTextFood(text);
       const parsed = parseSingleFood(ai, text);
       const message = formatTextResult(parsed);
@@ -164,7 +190,7 @@ async function handleEvent(event) {
       for (const f of parsed.items) {
         const cleanName = sanitizeFoodName(f.name);
         if (!cleanName) continue;
-        await saveLog(userId, cleanName, f, today);
+        await saveLog(userId, cleanName, f, getJstDate());
       }
     } catch (e) {
       console.error(e);
@@ -172,6 +198,78 @@ async function handleEvent(event) {
     }
     return;
   }
+}
+
+/* ===== Supabase 集計用 ===== */
+async function fetchFoodLogs(userId, date) {
+  const r = await fetch(
+    `${process.env.SUPABASE_URL}/rest/v1/food_logs?user_id=eq.${userId}&eaten_at=eq.${date}`,
+    {
+      headers: {
+        apikey: process.env.SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+      },
+    }
+  );
+  return await r.json();
+}
+
+/* ===== 日付指定パース（ここが追加） ===== */
+function parseSumDate(text) {
+  // 「1日の合計」は別で処理するので除外
+  if (text === "1日の合計") return null;
+
+  // 合計コマンドじゃなければ無視
+  if (!/合計/.test(text)) return null;
+
+  // 今日/昨日/一昨日
+  if (/今日/.test(text)) return getJstDate();
+  if (/昨日/.test(text)) return shiftJstDate(-1);
+  if (/一昨日/.test(text)) return shiftJstDate(-2);
+
+  // YYYY-MM-DD
+  const iso = text.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+
+  // MM/DD or M/D
+  const mdSlash = text.match(/(\d{1,2})\/(\d{1,2})/);
+  if (mdSlash) {
+    const y = getJstYear();
+    const m = String(mdSlash[1]).padStart(2, "0");
+    const d = String(mdSlash[2]).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  // 12月17日
+  const mdKanji = text.match(/(\d{1,2})月(\d{1,2})日/);
+  if (mdKanji) {
+    const y = getJstYear();
+    const m = String(mdKanji[1]).padStart(2, "0");
+    const d = String(mdKanji[2]).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  // 日付が取れない場合は null
+  return null;
+}
+
+function shiftJstDate(days) {
+  // JST基準で日付をずらす
+  const now = new Date();
+  const jst = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+  jst.setDate(jst.getDate() + days);
+  const y = jst.getFullYear();
+  const m = String(jst.getMonth() + 1).padStart(2, "0");
+  const d = String(jst.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function getJstYear() {
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+  }).formatToParts(new Date());
+  return parts.find(p => p.type === "year")?.value;
 }
 
 /* ===== JST日付 ===== */
