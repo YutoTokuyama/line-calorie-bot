@@ -26,6 +26,7 @@ async function handleEvent(event) {
   /* ===== テキスト ===== */
   if (event.message.type === "text") {
     const text = event.message.text.trim();
+    const lineMessageId = event.message.id; // ← 二重計上防止キー
 
     // 日付指定合計
     const sumDate = parseSumDate(text);
@@ -71,13 +72,15 @@ async function handleEvent(event) {
     const parsed = parseSingleFood(ai, text);
     await push(userId, formatTextResult(parsed));
 
-    await saveLog(userId, sanitizeFoodName(parsed.item.name), parsed.item, today);
+    // item_index=1（テキストは1件想定）
+    await saveLog(userId, sanitizeFoodName(parsed.item.name), parsed.item, today, lineMessageId, 1);
     return;
   }
 
   /* ===== 画像 ===== */
   if (event.message.type === "image") {
     await reply(replyToken, "📸 解析中です…少しお待ちください");
+    const lineMessageId = event.message.id; // ← 二重計上防止キー
 
     const imgRes = await fetch(
       `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
@@ -101,8 +104,10 @@ async function handleEvent(event) {
 
     await push(userId, formatImageResult(parsed));
 
-    for (const f of parsed.items) {
-      await saveLog(userId, sanitizeFoodName(f.name), f, today);
+    // 画像は複数料理になるので index を振る
+    for (let i = 0; i < parsed.items.length; i++) {
+      const f = parsed.items[i];
+      await saveLog(userId, sanitizeFoodName(f.name), f, today, lineMessageId, i + 1);
     }
   }
 }
@@ -169,14 +174,20 @@ async function openaiJson(input) {
 
 /* ===============================
    Supabase
+   - 二重計上防止： (user_id, line_message_id, item_index) をユニークにし upsert
 ================================ */
-async function saveLog(userId, name, f, date) {
-  await fetch(`${process.env.SUPABASE_URL}/rest/v1/food_logs`, {
+async function saveLog(userId, name, f, date, lineMessageId, itemIndex) {
+  const url =
+    `${process.env.SUPABASE_URL}/rest/v1/food_logs` +
+    `?on_conflict=user_id,line_message_id,item_index`;
+
+  await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       apikey: process.env.SUPABASE_ANON_KEY,
       Authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+      Prefer: "resolution=merge-duplicates,return=minimal",
     },
     body: JSON.stringify({
       user_id: userId,
@@ -186,6 +197,8 @@ async function saveLog(userId, name, f, date) {
       fat: f.f,
       carbs: f.c,
       eaten_at: date,
+      line_message_id: lineMessageId,
+      item_index: itemIndex,
     }),
   });
 }
@@ -271,14 +284,21 @@ function parseSingleFood(ai, fallback) {
   return { item, total: item, point: j?.point || "" };
 }
 
+/* ✅ NaN修正：?? の優先順位問題を避けて確実に足す */
 function sumRows(rows) {
   return rows.reduce(
-    (a, x) => ({
-      kcal: a.kcal + x.calories ?? x.kcal,
-      p: a.p + x.protein ?? x.p,
-      f: a.f + x.fat ?? x.f,
-      c: a.c + x.carbs ?? x.c,
-    }),
+    (a, x) => {
+      const kcal = (x.calories ?? x.kcal ?? 0);
+      const p = (x.protein ?? x.p ?? 0);
+      const f = (x.fat ?? x.f ?? 0);
+      const c = (x.carbs ?? x.c ?? 0);
+      return {
+        kcal: a.kcal + kcal,
+        p: a.p + p,
+        f: a.f + f,
+        c: a.c + c,
+      };
+    },
     { kcal: 0, p: 0, f: 0, c: 0 }
   );
 }
